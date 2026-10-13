@@ -19,3 +19,11 @@ launch.sh
 
 .DS_Store
 __pycache__/
+
+# Windows generated bundles, machine-specific settings, and test profiles
+.windows-install-check/
+.windows-smoke-tests/
+windows-config.json
+launcher.lock
+smoke-test.exit
+*.lnk

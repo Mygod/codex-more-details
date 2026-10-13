@@ -309,8 +309,7 @@ def patch_primary(src, initial_name):
 def node_check(name, text):
     node = shutil.which("node")
     if node is None:
-        print(f"  (node not found; skipped syntax check of {name})")
-        return
+        raise PatchError(f"node not found; cannot validate {name}")
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, name.replace(".js", ".mjs"))
         with open(p, "w", encoding="utf-8") as f:
@@ -322,13 +321,18 @@ def node_check(name, text):
 
 
 def app_version(app):
+    if os.name == "nt":
+        asar = os.path.join(app, "resources", "app.asar")
+        header, _, base = read_asar(asar)
+        info = json.loads(read_file(asar, base, entry(header, "package.json")))
+        return info.get("version"), "Windows"
     with open(os.path.join(app, "Contents/Info.plist"), "rb") as f:
         info = plistlib.load(f)
     return info.get("CFBundleShortVersionString"), info.get("CFBundleVersion")
 
 
 def patched_bundles(app):
-    asar = os.path.join(app, "Contents/Resources/app.asar")
+    asar = os.path.join(app, "resources/app.asar" if os.name == "nt" else "Contents/Resources/app.asar")
     header, raw, base = read_asar(asar)
     files = dict(walk(header))
     pick = lambda prefix: one(r"(?m)^webview/assets/" + prefix + r"-[0-9a-f]+\.js$", "\n".join(files), prefix).group(0)
@@ -337,6 +341,13 @@ def patched_bundles(app):
     primary = read_file(asar, base, files[primary_path]).decode("utf-8")
 
     new_initial, names = patch_initial(initial)
+    if os.name == "nt":
+        # Keep Alt+Space available for the Windows system menu.
+        new_initial = new_initial.replace(
+            "t.code!==`Space`||t.ctrlKey)return;let m=t.metaKey&&t.shiftKey&&!t.altKey,o=t.altKey&&!t.metaKey&&!t.shiftKey",
+            "t.code!==`Space`||t.metaKey)return;let m=t.ctrlKey&&t.shiftKey&&!t.altKey,o=!1",
+            1,
+        )
     new_primary = patch_primary(primary, os.path.basename(initial_path))
     print("  resolved:", ", ".join(f"{k}={v}" for k, v in sorted(names.items())))
     node_check(os.path.basename(initial_path), new_initial)
