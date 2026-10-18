@@ -87,10 +87,15 @@ def one(pattern, text, what):
     return matches[0]
 
 
+# Rolldown lazy module init: function X(){return(X=helper((()=>{...  The helper's
+# minified name changes between releases (`e` in 26.1007, `t` in 26.1013).
+INIT_RE = re.compile(r"function ([\w$]+)\(\)\{return\(\1=[\w$]+\(\(\(\)=>\{")
+
+
 def init_containing(text, assignment_pos):
     """Name of the rolldown lazy-init function whose body contains assignment_pos."""
     best = None
-    for m in re.finditer(r"function ([\w$]+)\(\)\{return\(\1=e\(\(\(\)=>\{", text):
+    for m in INIT_RE.finditer(text):
         if m.start() > assignment_pos:
             break
         best = m
@@ -100,7 +105,7 @@ def init_containing(text, assignment_pos):
 
 
 def init_after(text, pos):
-    m = re.compile(r"function ([\w$]+)\(\)\{return\(\1=e\(\(\(\)=>\{").search(text, pos)
+    m = INIT_RE.search(text, pos)
     if m is None:
         raise PatchError("could not find module init")
     return m.group(1)
@@ -250,7 +255,8 @@ def patch_primary(src, initial_name):
     imp = one(r'import\{([^}]*)\}from"\./' + re.escape(initial_name) + r'";', src, "app-initial import")
     src = src[:imp.start(1)] + "__qcMDRun as __qcMDRun,__qcCan as __qcCan," + src[imp.start(1):]
 
-    m = one(r"d=n===void 0\?`task`:n,f=([\w$]+)\(\),\[p,m\]=", src, "useIntl in selection overlay")
+    m = one(r"[\w$]+=n===void 0\?`task`:n,[\w$]+=([\w$]+)\(\),\[[\w$]+,[\w$]+\]=\(0,[\w$]+\.useState\)", src,
+            "useIntl in selection overlay")
     use_intl = m.group(1)
 
     # Codex thread overlay: compute an onMoreDetails handler and pass it down.

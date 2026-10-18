@@ -99,7 +99,7 @@ This removes the support folder and the launcher. ChatGPT itself was never chang
 - **The shortcut only works while ChatGPT is frontmost.** 26.1007 removed the standalone Quick Chat window from the main process, so it can't be a global shortcut.
 - **You must launch ChatGPT with "ChatGPT More Details".** Opening ChatGPT any other way (its own icon, Spotlight, a login item) starts it unpatched. The same goes for ChatGPT restarting itself, for example to install an update: quit it and reopen it with the launcher.
 - **Updates are handled automatically, or fall back to unpatched.** After a ChatGPT update, the next launch re-patches the new version. If OpenAI has changed the code enough that the patch no longer matches, you get a notification and ChatGPT opens normally, without the patch.
-- **Tested on ChatGPT 26.1007.30912 (20156)** on macOS.
+- **Tested on ChatGPT 26.1007.30912 (20156) and 26.1013.40934 (20770)** on macOS.
 
 ## macOS troubleshooting
 
