@@ -255,57 +255,68 @@ def patch_primary(src, initial_name):
     imp = one(r'import\{([^}]*)\}from"\./' + re.escape(initial_name) + r'";', src, "app-initial import")
     src = src[:imp.start(1)] + "__qcMDRun as __qcMDRun,__qcCan as __qcCan," + src[imp.start(1):]
 
-    m = one(r"[\w$]+=n===void 0\?`task`:n,[\w$]+=([\w$]+)\(\),\[[\w$]+,[\w$]+\]=\(0,[\w$]+\.useState\)", src,
+    m = one(r"[\w$]+=([\w$]+)===void 0\?`task`:\1,[\w$]+=([\w$]+)\(\),\[[\w$]+,[\w$]+\]=\(0,[\w$]+\.useState\)", src,
             "useIntl in selection overlay")
-    use_intl = m.group(1)
+    use_intl = m.group(2)
+
+    # The minifier reassigns local variable names between releases, so the two overlay components below are
+    # matched by structure, with every local name captured rather than assumed.
+    I = r"[\w$]+"
 
     # Codex thread overlay: compute an onMoreDetails handler and pass it down.
-    q = one(r"function ([\w$]+)\(e\)\{let t=\(0,([\w$]+)\.c\)\((\d+)\),\{actions:n,canOpenSideChat:r,"
-            r"scopeToThread:i,targetSelector:a\}=e,o=([\w$]+)\(([\w$]+)\),", src, "Codex selection overlay")
-    q_name, q_cache, q_size = q.group(1), q.group(2), int(q.group(3))
+    q = one(rf"function {I}\((?P<props>{I})\)\{{let (?P<t>{I})=\(0,(?P<cache>{I})\.c\)\((?P<size>\d+)\),"
+            rf"\{{actions:{I},canOpenSideChat:{I},scopeToThread:{I},targetSelector:(?P<sel>{I})\}}=(?P=props),"
+            rf"(?P<store>{I})={I}\({I}\),", src, "Codex selection overlay")
+    t, cache, size, sel, store = q["t"], q["cache"], int(q["size"]), q["sel"], q["store"]
+    T, S, A = re.escape(t), re.escape(store), re.escape(sel)
     q_end = src.index("}function ", q.end())
     body = src[q.start():q_end]
     reacts = set(re.findall(r"\(0,([\w$]+)\.useContext\)", body))
     if len(reacts) != 1:
         raise PatchError(f"React namespace: expected 1 name, found {sorted(reacts)}")
     react = reacts.pop()
-    thread_id = one(r"t\[2\]===o\?d=t\[3\]:\(d=([\w$]+)\(o\),t\[2\]=o,t\[3\]=d\)", body, "thread id").group(1)
-    body = body.replace(f"(0,{q_cache}.c)({q_size})", f"(0,{q_cache}.c)({q_size + 1})", 1)
-    body = body.replace(
-        q.group(0)[len(f"function {q_name}(e){{let t=(0,{q_cache}.c)({q_size}),"):],
-        q.group(0)[len(f"function {q_name}(e){{let t=(0,{q_cache}.c)({q_size}),"):]
-        + f"__qi={use_intl}(),__qc=__qcCan(),__md=(0,{react}.useMemo)(()=>__qc?(s,l)=>__qcMDRun(o,"
-          f"{{selectedText:s,target:l,sourceConversationId:{thread_id}(o),intl:__qi}}):void 0,[o,__qi,__qc]),",
-        1)
-    jm = one(r"t\[13\]!==h\|\|t\[14\]!==g\|\|t\[15\]!==_\|\|t\[16\]!==a\?\(v=\(0,([\w$]+)\.jsx\)\(([\w$]+),"
-             r"\{onAddResponseTextAnnotation:h,onOpenSideChat:g,targetContainerRefs:_,targetSelector:a\}\),"
-             r"t\[13\]=h,t\[14\]=g,t\[15\]=_,t\[16\]=a,t\[17\]=v\)", body, "overlay render")
-    inner = jm.group(2)
+    thread_id = one(rf"{T}\[2\]==={S}\?(?P<d>{I})={T}\[3\]:\((?P=d)=(?P<id>{I})\({S}\),{T}\[2\]={S},{T}\[3\]=(?P=d)\)",
+                    body, "thread id")["id"]
+    jm = one(rf"{T}\[13\]!==(?P<h>{I})\|\|{T}\[14\]!==(?P<g>{I})\|\|{T}\[15\]!==(?P<u>{I})\|\|{T}\[16\]!=={A}\?"
+             rf"\((?P<v>{I})=\(0,(?P<jsx>{I})\.jsx\)\((?P<inner>{I}),\{{onAddResponseTextAnnotation:(?P=h),"
+             rf"onOpenSideChat:(?P=g),targetContainerRefs:(?P=u),targetSelector:{A}\}}\),{T}\[13\]=(?P=h),"
+             rf"{T}\[14\]=(?P=g),{T}\[15\]=(?P=u),{T}\[16\]={A},{T}\[17\]=(?P=v)\)", body, "overlay render")
+    h, g, u, v, inner = jm["h"], jm["g"], jm["u"], jm["v"], jm["inner"]
     body = body[:jm.start()] + (
-        f"t[13]!==h||t[14]!==g||t[15]!==_||t[16]!==a||t[{q_size}]!==__md?(v=(0,{jm.group(1)}.jsx)({inner},"
-        f"{{onAddResponseTextAnnotation:h,onMoreDetails:__md,onOpenSideChat:g,targetContainerRefs:_,targetSelector:a}}),"
-        f"t[13]=h,t[14]=g,t[15]=_,t[16]=a,t[{q_size}]=__md,t[17]=v)") + body[jm.end():]
+        f"{t}[13]!=={h}||{t}[14]!=={g}||{t}[15]!=={u}||{t}[16]!=={sel}||{t}[{size}]!==__md?({v}=(0,{jm['jsx']}.jsx)("
+        f"{inner},{{onAddResponseTextAnnotation:{h},onMoreDetails:__md,onOpenSideChat:{g},targetContainerRefs:{u},"
+        f"targetSelector:{sel}}}),{t}[13]={h},{t}[14]={g},{t}[15]={u},{t}[16]={sel},{t}[{size}]=__md,{t}[17]={v})"
+    ) + body[jm.end():]
+    cut = q.end() - q.start()
+    body = body[:cut] + (
+        f"__qi={use_intl}(),__qc=__qcCan(),__md=(0,{react}.useMemo)(()=>__qc?(__s,__l)=>__qcMDRun({store},"
+        f"{{selectedText:__s,target:__l,sourceConversationId:{thread_id}({store}),intl:__qi}}):void 0,[{store},__qi,__qc]),"
+    ) + body[cut:]
+    body = body.replace(f"(0,{cache}.c)({size})", f"(0,{cache}.c)({size + 1})", 1)
     src = src[:q.start()] + body + src[q_end:]
 
     # Inner overlay: accept onMoreDetails and hand it to the shared selection menu.
-    e = one(r"function " + re.escape(inner) + r"\(e\)\{let t=\(0,([\w$]+)\.c\)\((\d+)\),\{onAddResponseTextAnnotation:n,"
-            r"onOpenSideChat:r,targetContainerRefs:i,targetSelector:a\}=e,o=([\w$]+)\(\);if\(n==null&&r==null\)"
-            r"return null;let s;t\[0\]!==n\|\|t\[1\]!==r\|\|t\[2\]!==o\?\(s=", src, "inner overlay")
-    e_cache, e_size, e_zoom = e.group(1), int(e.group(2)), e.group(3)
+    e = one(rf"function {re.escape(inner)}\((?P<props>{I})\)\{{let (?P<t>{I})=\(0,(?P<cache>{I})\.c\)\((?P<size>\d+)\),"
+            rf"\{{onAddResponseTextAnnotation:(?P<n>{I}),onOpenSideChat:(?P<r>{I}),targetContainerRefs:(?P<i>{I}),"
+            rf"targetSelector:(?P<a>{I})\}}=(?P=props),(?P<o>{I})=(?P<zoom>{I})\(\);if\((?P=n)==null&&(?P=r)==null\)"
+            rf"return null;let (?P<s>{I});(?P=t)\[0\]!==(?P=n)\|\|(?P=t)\[1\]!==(?P=r)\|\|(?P=t)\[2\]!==(?P=o)\?\((?P=s)=",
+            src, "inner overlay")
+    props, t, n, r, o, s, size = e["props"], e["t"], e["n"], e["r"], e["o"], e["s"], int(e["size"])
     e_end = src.index("}function ", e.end())
     body = src[e.start():e_end]
-    target = one(r"\{portalTarget:i,rect:a,selectedText:s,selectionRange:c,target:([\w$]+)\}=e", body,
+    target = one(rf"\{{portalTarget:{I},rect:{I},selectedText:{I},selectionRange:{I},target:({I})\}}={I}", body,
                  "selection target").group(1)
     body = body.replace(e.group(0), (
-        f"function {inner}(e){{let t=(0,{e_cache}.c)({e_size + 1}),{{onAddResponseTextAnnotation:n,onMoreDetails:__md,"
-        f"onOpenSideChat:r,targetContainerRefs:i,targetSelector:a}}=e,o={e_zoom}();if(n==null&&r==null&&__md==null)"
-        f"return null;let s;t[0]!==n||t[1]!==r||t[2]!==o||t[{e_size}]!==__md?(s="), 1)
-    old = "},onOpenSideChat:r})})},t[0]=n,t[1]=r,t[2]=o,t[3]=s):s=t[3]"
-    if body.count(old) != 1:
-        raise PatchError("inner overlay menu props not found")
-    body = body.replace(old, (
-        f"}},onMoreDetails:__md==null?void 0:e=>__md(e,{target}),onOpenSideChat:r}})}})}},"
-        f"t[0]=n,t[1]=r,t[2]=o,t[{e_size}]=__md,t[3]=s):s=t[3]"), 1)
+        f"function {inner}({props}){{let {t}=(0,{e['cache']}.c)({size + 1}),{{onAddResponseTextAnnotation:{n},"
+        f"onMoreDetails:__md,onOpenSideChat:{r},targetContainerRefs:{e['i']},targetSelector:{e['a']}}}={props},"
+        f"{o}={e['zoom']}();if({n}==null&&{r}==null&&__md==null)return null;let {s};"
+        f"{t}[0]!=={n}||{t}[1]!=={r}||{t}[2]!=={o}||{t}[{size}]!==__md?({s}="), 1)
+    T, N, R, O, S = (re.escape(x) for x in (t, n, r, o, s))
+    mp = one(rf"\}},onOpenSideChat:{R}\}}\)\}}\)\}},{T}\[0\]={N},{T}\[1\]={R},{T}\[2\]={O},{T}\[3\]={S}\):{S}={T}\[3\]",
+             body, "inner overlay menu props")
+    body = body[:mp.start()] + (
+        f"}},onMoreDetails:__md==null?void 0:__e=>__md(__e,{target}),onOpenSideChat:{r}}})}})}},"
+        f"{t}[0]={n},{t}[1]={r},{t}[2]={o},{t}[{size}]=__md,{t}[3]={s}):{s}={t}[3]") + body[mp.end():]
     src = src[:e.start()] + body + src[e_end:]
     return src
 
