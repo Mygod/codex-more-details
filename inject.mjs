@@ -1,5 +1,5 @@
-// Launch ChatGPT with a private DevTools pipe and serve the patched
-// app-initial/app-primary bundles in place of the shipped ones. Nothing in the
+// Launch ChatGPT with a private DevTools pipe and serve the patched webview
+// chunks in place of the shipped ones. Nothing in the
 // app bundle is modified, so OpenAI's code signature stays valid.
 //
 // usage: node inject.mjs --app /Applications/ChatGPT.app --patch-dir DIR [--helper spawn_disclaim]
@@ -46,13 +46,15 @@ toBrowser.on('error', () => {});
 let nextId = 0, buffer = '';
 const pending = new Map();
 const served = new Set();
+// Lazily loaded chunks are only requested when used, so the smoke test waits for the app-* startup bundles.
+const startup = Object.keys(patched).filter((f) => f.startsWith('app-'));
 const startupTimeout = setTimeout(() => {
   log('ERROR: DevTools did not become ready within 30 seconds');
   if (smoke) child.kill();
   process.exit(1);
 }, 30000);
 const testTimeout = smoke ? setTimeout(() => {
-  log('ERROR: smoke test did not serve both patched bundles');
+  log('ERROR: smoke test did not serve the patched startup bundles');
   child.kill();
   process.exit(1);
 }, 60000) : null;
@@ -98,7 +100,7 @@ async function onEvent({ method, params, sessionId }) {
       if (!r.error) {
         log('served patched', name);
         served.add(name);
-        if (smoke && served.size === Object.keys(patched).length && !checking) {
+        if (smoke && startup.every((f) => served.has(f)) && !checking) {
           checking = true;
           setTimeout(async () => {
             const initial = Object.keys(patched).find((f) => f.startsWith('app-initial-'));
@@ -109,7 +111,7 @@ async function onEvent({ method, params, sessionId }) {
             const value = result.result?.result?.value;
             completed = value?.run === 'function' && value?.capability === 'function';
             clearTimeout(testTimeout);
-            log(completed ? 'PASS: both patched bundles loaded and restored helper exports evaluated' : 'ERROR: restored helper export check failed', JSON.stringify(value ?? result.error ?? result.result?.exceptionDetails));
+            log(completed ? 'PASS: patched startup bundles loaded and restored helper exports evaluated' : 'ERROR: restored helper export check failed', JSON.stringify(value ?? result.error ?? result.result?.exceptionDetails));
             send('Browser.close');
             setTimeout(() => { child.kill(); process.exit(completed ? 0 : 1); }, 10000).unref();
           }, 3000);

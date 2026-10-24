@@ -18,7 +18,7 @@ Quit Codex completely, then open **Codex More Details** from the desktop or Star
 
 The installer validates the patch before installing scripts under your Windows Documents folder at `Codex\Tools\codex-more-details`. It creates separate shortcuts. Opening the original Codex shortcut starts the app without this workaround. An already-running Codex session is left running; the launcher tells you to quit it first.
 
-The Windows launcher preserves the Store package identity using `Invoke-CommandInDesktopPackage -PreventBreakaway`, verifies that identity, and substitutes the two bundles over a private DevTools pipe. It does not open a TCP debugging port. It checks cached bundle hashes and regenerates the patch when the app version or patch generator changes. If compatibility checks fail, it stops and tells you to use the original shortcut.
+The Windows launcher preserves the Store package identity using `Invoke-CommandInDesktopPackage -PreventBreakaway`, verifies that identity, and substitutes the patched bundles over a private DevTools pipe. It does not open a TCP debugging port. It checks cached bundle hashes and regenerates the patch when the app version or patch generator changes. If compatibility checks fail, it stops and tells you to use the original shortcut.
 
 ### Windows validation and limitations
 
@@ -88,7 +88,7 @@ This removes the support folder and the launcher. ChatGPT itself was never chang
 
 1. **ChatGPT More Details.app** runs `launch.sh` in the background.
 2. **`launch.sh`** reads ChatGPT's version. The first time it sees a version (or a changed patch script), it runs `more_details_patch.py` and caches the result. If ChatGPT is already running unpatched, it then offers to quit and reopen it.
-3. **`more_details_patch.py`** reads the two webview bundles it needs (`app-initial-*.js` and `app-primary-*.js`) out of `app.asar`, read-only. It finds the minified names it needs by regex instead of hard-coding them, adds the More details handler and the shortcut, and checks the output with `node --check`. If any pattern doesn't match exactly once, it fails and writes nothing.
+3. **`more_details_patch.py`** reads the webview chunks it needs (`app-initial-*.js`, `app-primary-*.js` and, since 26.1021, the lazily loaded chunk with the selection overlay) out of `app.asar`, read-only. It finds the code by its structure instead of by minified names, reaches names in other chunks through their import and export lists, adds the More details handler and the shortcut, and checks the output with `node --check`. If any pattern doesn't match exactly once, it fails and writes nothing.
 4. **`inject.mjs`** starts ChatGPT with `--remote-debugging-pipe`. This speaks the DevTools protocol over a private pipe that only the launcher holds, with no TCP port opened. It auto-attaches to each new page and holds it before any script runs (`waitForDebuggerOnStart`). It then intercepts responses for those two files (Fetch interception at the Response stage) and serves the patched copies instead.
 5. **`spawn_disclaim`** starts ChatGPT as its own "responsible process", so macOS privacy permissions (microphone, screen recording and so on) and your existing grants apply to ChatGPT rather than to the launcher.
 
@@ -99,7 +99,7 @@ This removes the support folder and the launcher. ChatGPT itself was never chang
 - **The shortcut only works while ChatGPT is frontmost.** 26.1007 removed the standalone Quick Chat window from the main process, so it can't be a global shortcut.
 - **You must launch ChatGPT with "ChatGPT More Details".** Opening ChatGPT any other way (its own icon, Spotlight, a login item) starts it unpatched. The same goes for ChatGPT restarting itself, for example to install an update: quit it and reopen it with the launcher.
 - **Updates are handled automatically, or fall back to unpatched.** After a ChatGPT update, the next launch re-patches the new version. If OpenAI has changed the code enough that the patch no longer matches, you get a notification and ChatGPT opens normally, without the patch.
-- **Tested on ChatGPT 26.1007.30912 (20156), 26.1013.40934 (20770) and 26.1016.61520 (21421)** on macOS.
+- **Tested on ChatGPT 26.1007.30912 (20156), 26.1013.40934 (20770), 26.1016.61520 (21421) and 26.1021.31345 (21828)** on macOS.
 
 ## macOS troubleshooting
 

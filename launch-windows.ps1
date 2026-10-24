@@ -37,7 +37,7 @@ try {
     if (Test-Path -LiteralPath $manifestPath) {
         try {
             $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-            $cacheValid = $manifest.packageFullName -eq $package.PackageFullName -and @($manifest.bundles).Count -eq 2
+            $cacheValid = $manifest.packageFullName -eq $package.PackageFullName -and @($manifest.bundles).Count -ge 2
             foreach ($bundle in $manifest.bundles) {
                 $cachedFile = Join-Path $cacheDir $bundle.name
                 if (-not (Test-Path -LiteralPath $cachedFile) -or
@@ -54,7 +54,7 @@ try {
         $bundles = @(Get-ChildItem -LiteralPath $cacheDir -Filter '*.js' | ForEach-Object {
             @{ name = $_.Name; sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }
         })
-        if ($bundles.Count -ne 2) { throw 'Expected exactly two validated bundles.' }
+        if ($bundles.Count -lt 2) { throw 'Expected at least two validated bundles.' }
         @{ packageFullName = $package.PackageFullName; bundles = $bundles } |
             ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
     }

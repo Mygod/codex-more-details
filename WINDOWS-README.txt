@@ -13,7 +13,7 @@ The original Codex shortcut opens the unpatched app.
 WHAT WAS INSTALLED
 Documents\Codex\Tools\codex-more-details contains the launcher, patch generator,
 injector, generated bundle cache, configuration, and launcher.log.
-The signed app installation is unchanged. The launcher substitutes two
+The signed app installation is unchanged. The launcher substitutes the patched
 JavaScript responses through a private DevTools pipe. No TCP debugging port
 is opened. Windows package context is preserved through
 Invoke-CommandInDesktopPackage with PreventBreakaway.

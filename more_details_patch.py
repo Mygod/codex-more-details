@@ -6,19 +6,23 @@ Codex thread selection overlay and deleted the "start Quick Chat from selected
 text" helper (see openai/codex#52483). This script ports the 26.1002.52244
 implementation back:
 
-  * app-initial-*.js: re-adds the selected-text Quick Chat starter (sends
-    "Tell me more about this" with the selection + source message as a
-    targeted reply, exactly like 26.1002) and a capability hook.
-  * app-primary-*.js: passes an `onMoreDetails` handler from the Codex thread
-    overlay into the shared selection menu, which still renders the button.
-  * app-initial-*.js also gets a Quick Chat shortcut: Cmd-Shift-Space (or
-    Option-Space, if the global "Toggle Mini" shortcut is cleared) toggles the
-    floating Quick Chat panel while ChatGPT is frontmost. 26.1007 removed the
-    standalone Quick Chat window from the main process, so this cannot be global.
+  * The chunk with the Quick Chat internals (app-initial-*.js) gets the
+    selected-text Quick Chat starter back. It sends "Tell me more about this"
+    with the selection + source message as a targeted reply, exactly like
+    26.1002, and adds a capability hook.
+  * The chunk with the Codex thread selection overlay (app-primary-*.js up to
+    26.1016, a lazily loaded chunk since 26.1021) passes an `onMoreDetails`
+    handler into the shared selection menu, which still renders the button.
+  * The Quick Chat host component (app-initial up to 26.1016, app-primary since
+    26.1021) registers a Quick Chat shortcut: Cmd-Shift-Space (or Option-Space,
+    if the global "Toggle Mini" shortcut is cleared) toggles the floating Quick
+    Chat panel while ChatGPT is frontmost. 26.1007 removed the standalone Quick
+    Chat window from the main process, so this cannot be global.
 
-Both bundles are read from ChatGPT.app's app.asar without modifying it.
-Minified identifiers are located by regex rather than hard-coded, and the
-patched output must pass `node --check`. If anything doesn't match (for example
+The chunks are read from ChatGPT.app's app.asar without modifying it. Code is
+located by its structure rather than by minified names, names defined in other
+chunks are reached through those chunks' own import and export lists, and every
+patched chunk must pass `node --check`. If anything doesn't match (for example
 after an update changes the surrounding code), --emit fails and writes nothing.
 
 The patched files are served at runtime by inject.mjs (via launch.sh). The app
@@ -41,6 +45,7 @@ import tempfile
 
 APP = "/Applications/ChatGPT.app"
 MARKER = "__qcMDRun"
+I = r"[\w$]+"  # a minified identifier
 
 
 class PatchError(Exception):
@@ -111,40 +116,152 @@ def init_after(text, pos):
     return m.group(1)
 
 
+# ----------------------------------------------------------- webview chunks
+
+class Bundle:
+    """The webview's JavaScript chunks in app.asar, read on demand and patched in memory."""
+
+    def __init__(self, asar):
+        header, _, self.base = read_asar(asar)
+        self.asar = asar
+        self.nodes = {path.rsplit("/", 1)[1]: node for path, node in walk(header)
+                      if path.startswith("webview/assets/") and path.endswith(".js") and "unpacked" not in node}
+        self.raw, self.text, self.changed = {}, {}, []
+
+    def __getitem__(self, name):
+        if name not in self.text:
+            self.text[name] = self.bytes(name).decode("utf-8")
+        return self.text[name]
+
+    def __setitem__(self, name, text):
+        self.text[name] = text
+        if name not in self.changed:
+            self.changed.append(name)
+
+    def bytes(self, name):
+        if name not in self.raw:
+            self.raw[name] = read_file(self.asar, self.base, self.nodes[name])
+        return self.raw[name]
+
+    def find(self, pattern, what, hint):
+        """The one match of pattern in any chunk, as (chunk, match). Only chunks containing hint are searched."""
+        found = [(name, m) for name in self.nodes if hint.encode() in self.bytes(name)
+                 for m in re.finditer(pattern, self[name])]
+        if len(found) != 1:
+            raise PatchError(f"{what}: expected 1 match, found {len(found)}")
+        if MARKER.encode() in self.bytes(found[0][0]):
+            raise PatchError(f"{found[0][0]} is already patched")
+        return found[0]
+
+
 def exports(text):
+    """The chunk's export statement and its {exported name: local name} map."""
     m = re.search(r"export\{([^}]*)\};?\s*(//# sourceMappingURL=[^\n]*)?\s*$", text)
     if m is None:
         raise PatchError("export list not found")
     names = {}
     for part in m.group(1).split(","):
         bits = part.strip().split(" as ")
-        names[bits[0]] = bits[-1]
+        names[bits[-1]] = bits[0]
     return m, names
 
 
-# ------------------------------------------------------- app-initial patch
+def imports(text):
+    """{local alias: (chunk, exported name)} for the chunk's static imports of other chunks."""
+    names = {}
+    for m in re.finditer(r'import\{([^}]*)\}from"\./([^"]+)";', text):
+        for part in m.group(1).split(","):
+            bits = part.strip().split(" as ")
+            names[bits[-1]] = (m.group(2), bits[0])
+    return names
 
-def patch_initial(src):
-    if MARKER in src:
-        raise PatchError("app-initial already patched")
+
+def canonical(bundle, chunk, name):
+    """(chunk, local name) where a name used in chunk is actually defined, following its imports."""
+    for _ in range(8):
+        imported = imports(bundle[chunk]).get(name)
+        if imported is None:
+            return chunk, name
+        chunk, exported = imported
+        name = exports(bundle[chunk])[1].get(exported)
+        if name is None:
+            raise PatchError(f"{chunk} doesn't export {exported}")
+    raise PatchError(f"import chain for {name} is too long")
+
+
+def bind(bundle, target, chunk, local):
+    """A name code in target can use for local (defined in chunk), exporting and importing it if needed.
+
+    Only imports target already has are extended, so no chunk starts loading earlier than it did."""
+    if target == chunk:
+        return local
+    m, names = exports(bundle[chunk])
+    exported = next((e for e, l in names.items() if l == local), None)
+    if exported is None:
+        exported = local if local.startswith("__qc") else f"__qc_{local}"
+        src = bundle[chunk]
+        bundle[chunk] = src[:m.start(1)] + f"{local} as {exported}," + src[m.start(1):]
+    src = bundle[target]
+    known = imports(src)
+    alias = next((a for a, ref in known.items() if ref == (chunk, exported)), None)
+    if alias is not None:
+        return alias
+    imp = re.search(r'import\{([^}]*)\}from"\./' + re.escape(chunk) + r'";', src)
+    if imp is None:
+        raise PatchError(f"{target} doesn't import {chunk}")
+    alias = exported if exported.startswith("__qc") else f"__qc_{exported}"
+    while alias in known:
+        alias += "_"
+    bundle[target] = src[:imp.start(1)] + f"{exported} as {alias}," + src[imp.start(1):]
+    return alias
+
+
+# ------------------------------------------------------------------ patterns
+
+TOGGLE_RE = (rf"function ({I})\(e,t=\{{\}}\)\{{if\(!e\.get\(({I}),\{{name:`chatgpt\.quick-chat`\}}\)\.isCapable\)return;"
+             rf"let n=e\.get\(({I})\),r=e\.get\(({I})\);if\(r!=null\)\{{({I})\(e,r\.hasConversation\);return\}}")
+
+# The Quick Chat host component, up to and including its useLayoutEffect call.
+HOST_RE = (rf"\{{surfaceOwner:(?P<owner>{I})\}}=(?P<props>{I}),(?P<store>{I})={I}\({I}\),(?P<k>{I});"
+           rf"(?P<t>{I})\[0\]===Symbol\.for\(`react\.memo_cache_sentinel`\)\?\((?P=k)=\{{name:`chatgpt\.quick-chat`\}},"
+           rf"(?P=t)\[0\]=(?P=k)\):(?P=k)=(?P=t)\[0\];let (?P<a>{I})=(?P<useFamily>{I})\((?P<bo>{I}),(?P=k)\)\.isCapable,"
+           rf"(?P<o>{I})=(?P<useValue>{I})\((?P<disabled>{I})\),(?P<s>{I})=(?P=a)&&!(?P=o),(?P<c>{I}),(?P<l>{I});"
+           rf"if\((?P=t)\[1\]!==(?P=s)\|\|(?P=t)\[2\]!==(?P=store)\?\((?P=c)=\(\)=>\{{(?P=s)\|\|(?P<close>{I})\((?P=store)\)\}},"
+           rf"(?P=l)=\[(?P=s),(?P=store)\],(?P=t)\[1\]=(?P=s),(?P=t)\[2\]=(?P=store),(?P=t)\[3\]=(?P=c),(?P=t)\[4\]=(?P=l)\):"
+           rf"\((?P=c)=(?P=t)\[3\],(?P=l)=(?P=t)\[4\]\),\(0,(?P<react>{I})\.useLayoutEffect\)\((?P=c),(?P=l)\),")
+
+SUBMIT_RE = (rf"let {I}=(?P<e>{I})\.get\((?P<model>{I}),(?P<t>{I})\);(?P=e)\.set\((?P<submitting>{I}),(?P=t),!0\);try\{{"
+             rf"let (?P<hints>{I})={I}\?\?(?P=e)\.get\({I},(?P=t)\),{I}={I}==null\|\|(?P<prompt>{I})\.trim\(\)\.length===0\?"
+             rf"void 0:(?P<build>{I})\(\{{messageMetadata:{I},oneTurnDeveloperInstructions:{I},prompt:(?P=prompt),"
+             rf"systemHints:(?P=hints)\}}\),{I}=await (?P<send>{I})\((?P=e),\{{conversationId:(?P=t),")
+
+# Pending prompt (null) and pending markdown (false) atoms, followed by three list atoms. 26.1021 inserted a
+# derived atom between the first two.
+PENDING_RE = (rf"(?P<prompt>{I})=(?P<f>{I})\((?P<s>{I}),e=>null\),(?:{I}={I}\((?P=s),\(e,\{{get:t\}}\)=>[^;]*?\),)?"
+              rf"(?P<markdown>{I})=(?P=f)\((?P=s),e=>!1\),{I}=(?P=f)\((?P=s),e=>\[\]\),{I}=(?P=f)\((?P=s),e=>\[\]\),"
+              rf"{I}=(?P=f)\((?P=s),e=>\[\]\)")
+
+# The shared selection menu calls useIntl() right after defaulting its terminology prop.
+USE_INTL_RE = rf"{I}=({I})===void 0\?`task`:\1,{I}=({I})\(\),\[{I},{I}\]=\(0,{I}\.useState\)"
+
+# The Codex thread selection overlay. Local names are captured rather than assumed, since the minifier
+# reassigns them between releases.
+OUTER_RE = (rf"function {I}\((?P<props>{I})\)\{{let (?P<t>{I})=\(0,(?P<cache>{I})\.c\)\((?P<size>\d+)\),"
+            rf"\{{actions:{I},canOpenSideChat:{I},scopeToThread:{I},targetSelector:(?P<sel>{I})\}}=(?P=props),"
+            rf"(?P<store>{I})={I}\({I}\),")
+
+
+# --------------------------------------------------- Quick Chat internals
+
+def patch_core(bundle):
+    core, m = bundle.find(TOGGLE_RE, "quick chat toggle", "chatgpt.quick-chat")
+    src = bundle[core]
     n = {}
-
-    m = one(r"function ([\w$]+)\(e,t=\{\}\)\{if\(!e\.get\(([\w$]+),\{name:`chatgpt\.quick-chat`\}\)\.isCapable\)return;"
-            r"let n=e\.get\(([\w$]+)\),r=e\.get\(([\w$]+)\);if\(r!=null\)\{([\w$]+)\(e,r\.hasConversation\);return\}",
-            src, "quick chat toggle")
     n["toggle"], n["Bo"], n["session"], n["show"] = m.group(1), m.group(2), m.group(3), m.group(5)
 
     m = one(r"function " + re.escape(n["show"]) + r"\(e,t\)\{let n=!e\.get\(([\w$]+)\);e\.set\(\1,!0\),"
             r"e\.set\([\w$]+,n&&!t\?`welcome`:`recent`\),e\.set\(([\w$]+),!0\)\}", src, "quick chat visibility atom")
     n["visible"] = m.group(2)
-
-    host = one(r"\{name:`chatgpt\.quick-chat`\},t\[0\]=i\):i=t\[0\];let a=[\w$]+\([\w$]+,i\)\.isCapable,o=[\w$]+\([\w$]+\),"
-               r"s=a&&!o,c,l;if\(t\[1\]!==s\|\|t\[2\]!==r\?\(c=\(\)=>\{s\|\|([\w$]+)\(r\)\},l=\[s,r\],t\[1\]=s,"
-               r"t\[2\]=r,t\[3\]=c,t\[4\]=l\):\(c=t\[3\],l=t\[4\]\),\(0,([\w$]+)\.useLayoutEffect\)\(c,l\),", src,
-               "quick chat host")
-    if "{surfaceOwner:n}=e,r=" not in src[host.start() - 120:host.start()]:
-        raise PatchError("quick chat host: unexpected props")
-    n["close"], host_react = host.group(1), host.group(2)
 
     m = one(r"function ([\w$]+)\(e,\{conversationId:t=([\w$]+)\(\),contextSourceThread:n=null,projectId:r=null,"
             r"projectName:i=null,preservePreviousSession:a=!1\}=\{\}\)", src, "quick chat session opener")
@@ -155,17 +272,14 @@ def patch_initial(src):
             r"\);r\?\.conversationId!==t\|\|r\.hasConversation\|\|", src, "quick chat conversation-started")
     n["markStarted"] = m.group(1)
 
-    m = one(r"let p=e\.get\(([\w$]+),t\);e\.set\(([\w$]+),t,!0\);try\{let f=u\?\?e\.get\([\w$]+,t\),"
-            r"m=o==null\|\|c\.trim\(\)\.length===0\?void 0:([\w$]+)\(\{messageMetadata:i,oneTurnDeveloperInstructions:a,"
-            r"prompt:c,systemHints:f\}\),h=await ([\w$]+)\(e,\{conversationId:t,", src, "ChatGPT submit helper")
-    n["modelSettings"], n["submitting"], n["buildMessages"], n["send"] = m.groups()
+    m = one(SUBMIT_RE, src, "ChatGPT submit helper")
+    n["modelSettings"], n["submitting"], n["buildMessages"], n["send"] = m["model"], m["submitting"], m["build"], m["send"]
     send_def = one(r"(?:async )?function " + re.escape(n["send"]) + r"\(", src, "send() definition")
     build_def = one(r"function " + re.escape(n["buildMessages"]) + r"\(", src, "buildMessages() definition")
 
-    m = one(r"([\w$]+)=([\w$]+)\(([\w$]+),e=>null\),([\w$]+)=\2\(\3,e=>!1\),[\w$]+=\2\(\3,e=>\[\]\),"
-            r"[\w$]+=\2\(\3,e=>\[\]\),[\w$]+=\2\(\3,e=>\[\]\),[\w$]+=\2\(\3,\(e,\{scope:t\}\)=>\[\]", src,
-            "pending prompt atoms")
-    n["pendingPrompt"], n["pendingMarkdown"] = m.group(1), m.group(4)
+    m = one(PENDING_RE, src, "pending prompt atoms")
+    n["pendingPrompt"], n["pendingMarkdown"] = m["prompt"], m["markdown"]
+    pending_pos = m.start()
 
     m = one(r"async function ([\w$]+)\(e,\{isBackgroundSubagentsEnabled:t,sourceThread:n,signal:r\}\)\{let i=\(await "
             r"[\w$]+\(e,\{sourceThread:n,signal:r,isBackgroundSubagentsEnabled:t,markdownLimit:", src,
@@ -191,10 +305,6 @@ def patch_initial(src):
     n["plainText"] = m.group(1)
     plain_pos = m.start()
 
-    m = one(r"\{name:`chatgpt\.quick-chat`\},t\[0\]=i\):i=t\[0\];let a=([\w$]+)\(" + re.escape(n["Bo"]) +
-            r",i\)\.isCapable,o=([\w$]+)\(([\w$]+)\),s=a&&!o", src, "quick chat host gate")
-    n["useFamily"], n["useValue"], n["disabled"] = m.groups()
-
     toasts = re.findall(r"\.get\(([\w$]+)\)\.danger\(", src)
     if not toasts:
         raise PatchError("toast atom not found")
@@ -206,11 +316,19 @@ def patch_initial(src):
         init_containing(src, session_pos),
         init_containing(src, submitting_pos),
         init_containing(src, server_pos),
+        init_containing(src, pending_pos),
         init_after(src, send_def.end()),
         init_after(src, build_def.end()),
         init_after(src, context_pos),
         init_after(src, plain_pos),
     })
+
+    # The host component's capability gate supplies the hooks for __qcCan and the panel's close function.
+    host, h = bundle.find(HOST_RE, "quick chat host", "surfaceOwner")
+    if canonical(bundle, host, h["bo"]) != canonical(bundle, core, n["Bo"]):
+        raise PatchError("quick chat host: capability atom doesn't match the toggle's")
+    for key in ("useFamily", "useValue", "disabled", "close"):
+        n[key] = bind(bundle, core, *canonical(bundle, host, h[key]))
 
     js = r"""
 ;/* codex-more-details-restore: port of 26.1002.52244 selected-text Quick Chat */
@@ -237,36 +355,32 @@ function __qcMDRun(e,{selectedText:s,target:l,sourceConversationId:c,intl:I}){if
     }
     js = re.sub(r"\b(" + "|".join(sorted(subs, key=len, reverse=True)) + r")\b", lambda m: subs[m.group(1)], js)
 
-    hook = f"(0,{host_react}.useLayoutEffect)(c,l),"
-    src = src[:host.end() - len(hook)] + hook + f"(0,{host_react}.useEffect)(()=>__qcBindKeys(r,n,s),[r,n,s])," + src[host.end():]
+    src = bundle[core]
+    exp, _ = exports(src)
+    bundle[core] = (src[:exp.start()] + js + "\n" + src[exp.start():exp.start(1)]
+                    + "__qcMDRun as __qcMDRun,__qcCan as __qcCan,__qcBindKeys as __qcBindKeys," + src[exp.start(1):])
 
-    exp_match, _ = exports(src)
-    head, tail = src[:exp_match.start()], src[exp_match.start():]
-    tail = tail.replace("export{", "export{__qcMDRun as __qcMDRun,__qcCan as __qcCan,", 1)
-    return head + js + "\n" + tail, n
+    # Register the shortcut while the host is mounted.
+    bind_keys = bind(bundle, host, core, "__qcBindKeys")
+    src = bundle[host]
+    h = one(HOST_RE, src, "quick chat host")
+    args = f"{h['store']},{h['owner']},{h['s']}"
+    bundle[host] = src[:h.end()] + f"(0,{h['react']}.useEffect)(()=>{bind_keys}({args}),[{args}])," + src[h.end():]
+    return core, n
 
 
-# ------------------------------------------------------- app-primary patch
+# --------------------------------------------------- selection overlays
 
-def patch_primary(src, initial_name):
-    if MARKER in src:
-        raise PatchError("app-primary already patched")
-
-    imp = one(r'import\{([^}]*)\}from"\./' + re.escape(initial_name) + r'";', src, "app-initial import")
-    src = src[:imp.start(1)] + "__qcMDRun as __qcMDRun,__qcCan as __qcCan," + src[imp.start(1):]
-
-    m = one(r"[\w$]+=([\w$]+)===void 0\?`task`:\1,[\w$]+=([\w$]+)\(\),\[[\w$]+,[\w$]+\]=\(0,[\w$]+\.useState\)", src,
-            "useIntl in selection overlay")
-    use_intl = m.group(2)
-
-    # The minifier reassigns local variable names between releases, so the two overlay components below are
-    # matched by structure, with every local name captured rather than assumed.
-    I = r"[\w$]+"
+def patch_overlays(bundle, core):
+    menu, m = bundle.find(USE_INTL_RE, "useIntl in selection menu", "conversationTerminology")
+    chunk, _ = bundle.find(OUTER_RE, "Codex selection overlay", "canOpenSideChat")
+    use_intl = bind(bundle, chunk, *canonical(bundle, menu, m.group(2)))
+    md_run = bind(bundle, chunk, core, "__qcMDRun")
+    can = bind(bundle, chunk, core, "__qcCan")
 
     # Codex thread overlay: compute an onMoreDetails handler and pass it down.
-    q = one(rf"function {I}\((?P<props>{I})\)\{{let (?P<t>{I})=\(0,(?P<cache>{I})\.c\)\((?P<size>\d+)\),"
-            rf"\{{actions:{I},canOpenSideChat:{I},scopeToThread:{I},targetSelector:(?P<sel>{I})\}}=(?P=props),"
-            rf"(?P<store>{I})={I}\({I}\),", src, "Codex selection overlay")
+    src = bundle[chunk]
+    q = one(OUTER_RE, src, "Codex selection overlay")
     t, cache, size, sel, store = q["t"], q["cache"], int(q["size"]), q["sel"], q["store"]
     T, S, A = re.escape(t), re.escape(store), re.escape(sel)
     q_end = src.index("}function ", q.end())
@@ -289,13 +403,15 @@ def patch_primary(src, initial_name):
     ) + body[jm.end():]
     cut = q.end() - q.start()
     body = body[:cut] + (
-        f"__qi={use_intl}(),__qc=__qcCan(),__md=(0,{react}.useMemo)(()=>__qc?(__s,__l)=>__qcMDRun({store},"
+        f"__qi={use_intl}(),__qc={can}(),__md=(0,{react}.useMemo)(()=>__qc?(__s,__l)=>{md_run}({store},"
         f"{{selectedText:__s,target:__l,sourceConversationId:{thread_id}({store}),intl:__qi}}):void 0,[{store},__qi,__qc]),"
     ) + body[cut:]
     body = body.replace(f"(0,{cache}.c)({size})", f"(0,{cache}.c)({size + 1})", 1)
-    src = src[:q.start()] + body + src[q_end:]
+    bundle[chunk] = src[:q.start()] + body + src[q_end:]
 
     # Inner overlay: accept onMoreDetails and hand it to the shared selection menu.
+    chunk, inner = canonical(bundle, chunk, inner)
+    src = bundle[chunk]
     e = one(rf"function {re.escape(inner)}\((?P<props>{I})\)\{{let (?P<t>{I})=\(0,(?P<cache>{I})\.c\)\((?P<size>\d+)\),"
             rf"\{{onAddResponseTextAnnotation:(?P<n>{I}),onOpenSideChat:(?P<r>{I}),targetContainerRefs:(?P<i>{I}),"
             rf"targetSelector:(?P<a>{I})\}}=(?P=props),(?P<o>{I})=(?P<zoom>{I})\(\);if\((?P=n)==null&&(?P=r)==null\)"
@@ -317,8 +433,7 @@ def patch_primary(src, initial_name):
     body = body[:mp.start()] + (
         f"}},onMoreDetails:__md==null?void 0:__e=>__md(__e,{target}),onOpenSideChat:{r}}})}})}},"
         f"{t}[0]={n},{t}[1]={r},{t}[2]={o},{t}[{size}]=__md,{t}[3]={s}):{s}={t}[3]") + body[mp.end():]
-    src = src[:e.start()] + body + src[e_end:]
-    return src
+    bundle[chunk] = src[:e.start()] + body + src[e_end:]
 
 
 # ------------------------------------------------------------------ main
@@ -349,27 +464,20 @@ def app_version(app):
 
 
 def patched_bundles(app):
-    asar = os.path.join(app, "resources/app.asar" if os.name == "nt" else "Contents/Resources/app.asar")
-    header, raw, base = read_asar(asar)
-    files = dict(walk(header))
-    pick = lambda prefix: one(r"(?m)^webview/assets/" + prefix + r"-[0-9a-f]+\.js$", "\n".join(files), prefix).group(0)
-    initial_path, primary_path = pick("app-initial"), pick("app-primary")
-    initial = read_file(asar, base, files[initial_path]).decode("utf-8")
-    primary = read_file(asar, base, files[primary_path]).decode("utf-8")
-
-    new_initial, names = patch_initial(initial)
+    bundle = Bundle(os.path.join(app, "resources/app.asar" if os.name == "nt" else "Contents/Resources/app.asar"))
+    core, names = patch_core(bundle)
+    patch_overlays(bundle, core)
     if os.name == "nt":
         # Keep Alt+Space available for the Windows system menu.
-        new_initial = new_initial.replace(
+        bundle[core] = bundle[core].replace(
             "t.code!==`Space`||t.ctrlKey)return;let m=t.metaKey&&t.shiftKey&&!t.altKey,o=t.altKey&&!t.metaKey&&!t.shiftKey",
             "t.code!==`Space`||t.metaKey)return;let m=t.ctrlKey&&t.shiftKey&&!t.altKey,o=!1",
             1,
         )
-    new_primary = patch_primary(primary, os.path.basename(initial_path))
     print("  resolved:", ", ".join(f"{k}={v}" for k, v in sorted(names.items())))
-    node_check(os.path.basename(initial_path), new_initial)
-    node_check(os.path.basename(primary_path), new_primary)
-    return {os.path.basename(initial_path): new_initial, os.path.basename(primary_path): new_primary}
+    for name in bundle.changed:
+        node_check(name, bundle[name])
+    return {name: bundle[name] for name in bundle.changed}
 
 
 def emit(app, out_dir):
