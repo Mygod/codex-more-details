@@ -218,8 +218,10 @@ def bind(bundle, target, chunk, local):
 
 # ------------------------------------------------------------------ patterns
 
+# The toggle's header. Its body shows the panel with show(e,r.hasConversation), written as an if chain up
+# to 26.1021 and as a nested ternary since 26.1027, so the show call is looked up separately.
 TOGGLE_RE = (rf"function ({I})\(e,t=\{{\}}\)\{{if\(!e\.get\(({I}),\{{name:`chatgpt\.quick-chat`\}}\)\.isCapable\)return;"
-             rf"let n=e\.get\(({I})\),r=e\.get\(({I})\);if\(r!=null\)\{{({I})\(e,r\.hasConversation\);return\}}")
+             rf"let n=e\.get\(({I})\),r=e\.get\(({I})\);")
 
 # The Quick Chat host component, up to and including its useLayoutEffect call.
 HOST_RE = (rf"\{{surfaceOwner:(?P<owner>{I})\}}=(?P<props>{I}),(?P<store>{I})={I}\({I}\),(?P<k>{I});"
@@ -257,7 +259,9 @@ def patch_core(bundle):
     core, m = bundle.find(TOGGLE_RE, "quick chat toggle", "chatgpt.quick-chat")
     src = bundle[core]
     n = {}
-    n["toggle"], n["Bo"], n["session"], n["show"] = m.group(1), m.group(2), m.group(3), m.group(5)
+    n["toggle"], n["Bo"], n["session"] = m.group(1), m.group(2), m.group(3)
+    n["show"] = one(rf"({I})\(e,r\.hasConversation\)", src[m.end():src.index("}function ", m.end())],
+                    "quick chat toggle's show call").group(1)
 
     m = one(r"function " + re.escape(n["show"]) + r"\(e,t\)\{let n=!e\.get\(([\w$]+)\);e\.set\(\1,!0\),"
             r"e\.set\([\w$]+,n&&!t\?`welcome`:`recent`\),e\.set\(([\w$]+),!0\)\}", src, "quick chat visibility atom")
@@ -300,8 +304,9 @@ def patch_core(bundle):
             src, "streaming atom")
     n["streaming"] = m.group(1)
 
-    m = one(r"function ([\w$]+)\(e,\{includeImages:t=!1,includeCollapsedContent:n=!1\}=\{\}\)\{let r=e\."
-            r"ownerDocument\.createRange\(\);return r\.selectNodeContents\(e\)", src, "plain text extractor")
+    # 26.1027 added a chatGptImageMode option, so later options and the local names are allowed to vary.
+    m = one(rf"function ({I})\(({I}),\{{includeImages:{I}=!1,includeCollapsedContent:{I}=!1[^}}]*\}}=\{{\}}\)\{{"
+            rf"let ({I})=\2\.ownerDocument\.createRange\(\);return \3\.selectNodeContents\(\2\)", src, "plain text extractor")
     n["plainText"] = m.group(1)
     plain_pos = m.start()
 
