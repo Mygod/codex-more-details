@@ -4,35 +4,37 @@
 ChatGPT/Codex desktop 26.1007.x dropped the `onMoreDetails` wiring from the
 Codex thread selection overlay and deleted the "start Quick Chat from selected
 text" helper (see openai/codex#52483). This script ports the 26.1002.52244
-implementation back:
+implementation back into the current app (26.1029 and later, which ship an
+rspack bundle):
 
-  * The chunk with the Quick Chat internals (app-initial-*.js) gets the
-    selected-text Quick Chat starter back. It sends "Tell me more about this"
-    with the selection + source message as a targeted reply, exactly like
-    26.1002, and adds a capability hook.
-  * The chunk with the Codex thread selection overlay (app-primary-*.js up to
-    26.1016, a lazily loaded chunk since 26.1021) passes an `onMoreDetails`
-    handler into the shared selection menu, which still renders the button.
-  * The Quick Chat host component (app-initial up to 26.1016, app-primary since
-    26.1021) registers a Quick Chat shortcut: Cmd-Shift-Space (or Option-Space,
-    if the global "Toggle Mini" shortcut is cleared) toggles the floating Quick
-    Chat panel while ChatGPT is frontmost. 26.1007 removed the standalone Quick
-    Chat window from the main process, so this cannot be global.
+  * The Quick Chat state module gets the selected-text Quick Chat starter back.
+    It sends "Tell me more about this" with the selection + source message as a
+    targeted reply, exactly like 26.1002.
+  * Every copy of the Codex thread selection overlay module passes an
+    `onMoreDetails` handler into the shared selection menu, which still renders
+    the button.
+  * The Quick Chat host component registers a Quick Chat shortcut: Cmd-Shift-Space
+    (or Option-Space, if the global "Toggle Mini" shortcut is cleared) toggles
+    the floating Quick Chat panel while ChatGPT is frontmost. 26.1007 removed the
+    standalone Quick Chat window from the main process, so this cannot be global.
 
-The chunks are read from ChatGPT.app's app.asar without modifying it. Code is
-located by its structure rather than by minified names, names defined in other
-chunks are reached through those chunks' own import and export lists, and every
-patched chunk must pass `node --check`. If anything doesn't match (for example
-after an update changes the surrounding code), --emit fails and writes nothing.
+The bundle is read from ChatGPT.app's app.asar without modifying it. Each chunk
+is an ES module whose `__webpack_modules__` table holds one function per source
+module; Node imports a chunk (which only defines those functions) to get exact
+module boundaries. Code is located by its structure rather than by minified
+names, names in other modules are reached through the module loader and the
+modules' own export maps, and every patched chunk must pass `node --check`. If
+anything doesn't match, --emit fails and writes nothing.
 
-The patched files are served at runtime by inject.mjs (via launch.sh). The app
-bundle itself is never modified: 26.1007's Electron reads its asar integrity
-hash through the code signature, so an edited bundle aborts at launch.
+The patched chunks are served at runtime by inject.mjs (via launch.sh). The app
+bundle itself is never modified: Electron reads its asar integrity hash through
+the code signature, so an edited bundle aborts at launch.
 
 Usage:
   python3 more_details_patch.py --emit DIR [--app /Applications/ChatGPT.app]
 """
 import argparse
+import collections
 import json
 import os
 import plistlib
@@ -45,7 +47,26 @@ import tempfile
 
 APP = "/Applications/ChatGPT.app"
 MARKER = "__qcMDRun"
-I = r"[\w$]+"  # a minified identifier
+I = r"[\w$]+"     # a minified identifier
+M = rf"{I}\.{I}"  # a member of another module, as a module sees it: `a.G` for `var a=n("ChYf")`
+
+# Prints {module id: [start, end, params]} for a chunk, in code points, using V8's own parse of its module table.
+MODMAP_JS = r"""
+import fs from 'node:fs'; import { pathToFileURL } from 'node:url';
+const file = process.argv[2], src = fs.readFileSync(file, 'utf8');
+const high = (s) => (s.match(/[\uD800-\uDBFF]/g) ?? []).length;
+const { __webpack_modules__: table } = await import(pathToFileURL(file));
+const out = {}; let from = 0, cp = 0;
+for (const [id, fn] of Object.entries(table ?? {})) {
+  const text = fn.toString(), at = src.indexOf(text, from);
+  if (at < 0) throw new Error(`module ${id} not located`);
+  cp += at - from - high(src.slice(from, at));
+  const len = text.length - high(text);
+  out[id] = [cp, cp + len, text.slice(text.indexOf('(') + 1, text.indexOf(')'))];
+  cp += len; from = at + text.length;
+}
+console.log(JSON.stringify(out));
+"""
 
 
 class PatchError(Exception):
@@ -92,253 +113,283 @@ def one(pattern, text, what):
     return matches[0]
 
 
-# Rolldown lazy module init: function X(){return(X=helper((()=>{...  The helper's
-# minified name changes between releases (`e` in 26.1007, `t` in 26.1013).
-INIT_RE = re.compile(r"function ([\w$]+)\(\)\{return\(\1=[\w$]+\(\(\(\)=>\{")
+def node_binary():
+    node = shutil.which("node")
+    if node is None:
+        raise PatchError("node not found")
+    return node
 
 
-def init_containing(text, assignment_pos):
-    """Name of the rolldown lazy-init function whose body contains assignment_pos."""
-    best = None
-    for m in INIT_RE.finditer(text):
-        if m.start() > assignment_pos:
-            break
-        best = m
-    if best is None:
-        raise PatchError("could not find module init")
-    return best.group(1)
+# ------------------------------------------------------------------ the bundle
+
+class Module:
+    """One module factory, `id(module,exports,require){...}`, in one chunk. A module can appear in several chunks."""
+
+    def __init__(self, chunk, mid, start, end, params):
+        self.chunk, self.id, self.start, self.end = chunk, mid, start, end
+        self.exports, self.require = (params + ["", ""])[1:3]
+
+    @property
+    def key(self):
+        return self.chunk, self.id
 
 
-def init_after(text, pos):
-    m = INIT_RE.search(text, pos)
+class Bundle:
+    """The webview's JavaScript chunks in app.asar, read on demand and patched module by module in memory."""
+
+    def __init__(self, asar, workdir):
+        header, _, self.base = read_asar(asar)
+        self.asar, self.workdir = asar, workdir
+        self.nodes = {path.rsplit("/", 1)[1]: node for path, node in walk(header)
+                      if path.startswith("webview/assets/") and path.endswith(".js") and "unpacked" not in node}
+        self.raw, self.src, self.maps, self.hits, self.patched = {}, {}, {}, {}, {}
+        with open(os.path.join(workdir, "modmap.mjs"), "w") as f:
+            f.write(MODMAP_JS)
+
+    def scan(self, hints):
+        """Read every chunk once, noting which chunks contain each hint and keeping only those."""
+        hints = [h for h in hints if h not in self.hits]
+        found = {h: [] for h in hints}
+        with open(self.asar, "rb") as f:
+            for name, node in self.nodes.items():
+                if name in self.raw:
+                    data = self.raw[name]
+                else:
+                    f.seek(self.base + int(node["offset"]))
+                    data = f.read(node["size"])
+                for h in hints:
+                    if h.encode() in data:
+                        found[h].append(name)
+                        self.raw[name] = data
+        self.hits.update(found)
+
+    def source(self, chunk):
+        if chunk not in self.src:
+            if chunk not in self.raw:
+                self.raw[chunk] = read_file(self.asar, self.base, self.nodes[chunk])
+            self.src[chunk] = self.raw[chunk].decode("utf-8")
+        return self.src[chunk]
+
+    def modules(self, chunk):
+        if chunk not in self.maps:
+            path = os.path.join(self.workdir, chunk.replace(".js", ".mjs"))
+            with open(path, "wb") as f:
+                f.write(self.raw[chunk] if chunk in self.raw else self.source(chunk).encode())
+            r = subprocess.run([node_binary(), os.path.join(self.workdir, "modmap.mjs"), path],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                raise PatchError(f"couldn't read the module table of {chunk}:\n{r.stderr[-1000:]}")
+            self.maps[chunk] = [Module(chunk, mid, s, e, p.split(",")) for mid, (s, e, p) in json.loads(r.stdout).items()]
+        return self.maps[chunk]
+
+    def module_at(self, chunk, pos):
+        for mod in self.modules(chunk):
+            if mod.start <= pos < mod.end:
+                return mod
+        raise PatchError(f"no module at {chunk}:{pos}")
+
+    def module(self, chunk, mid):
+        for mod in self.modules(chunk):
+            if mod.id == mid:
+                return mod
+        raise PatchError(f"{chunk} has no module {mid}")
+
+    def text(self, mod):
+        return self.patched.get(mod.key) or self.source(mod.chunk)[mod.start:mod.end]
+
+    def set_text(self, mod, text):
+        self.patched[mod.key] = text
+
+    def find(self, pattern, what, hint, count=1):
+        """[(module, match)] for pattern in chunks containing hint; count=None allows any number above zero."""
+        self.scan([hint])
+        found = []
+        for chunk in self.hits[hint]:
+            src = self.source(chunk)
+            for m in re.finditer(pattern, src):
+                found.append((self.module_at(chunk, m.start()), m))
+        if (len(found) != count) if count else not found:
+            raise PatchError(f"{what}: expected {count or 'at least 1'} match(es), found {len(found)}")
+        for mod, _ in found:
+            if MARKER in self.source(mod.chunk)[mod.start:mod.end]:
+                raise PatchError(f"{mod.chunk} is already patched")
+        return found
+
+    def output(self):
+        """{chunk: patched source} for every chunk with a patched module."""
+        out = {}
+        for chunk in sorted({c for c, _ in self.patched}):
+            src = self.source(chunk)
+            for mod in sorted((m for m in self.modules(chunk) if m.key in self.patched), key=lambda m: -m.start):
+                src = src[:mod.start] + self.patched[mod.key] + src[mod.end:]
+            out[chunk] = src
+        return out
+
+
+# ------------------------------------------------------------------ linking
+
+def module_var(b, mod, var):
+    """The module id a module-level `var x=require("id")` in mod refers to."""
+    m = re.search(rf'(?<![\w$.]){re.escape(var)}={re.escape(mod.require)}\("([^"]+)"\)', b.text(mod))
     if m is None:
-        raise PatchError("could not find module init")
+        raise PatchError(f"{mod.id}: no module variable {var}")
     return m.group(1)
 
 
-# ----------------------------------------------------------- webview chunks
-
-class Bundle:
-    """The webview's JavaScript chunks in app.asar, read on demand and patched in memory."""
-
-    def __init__(self, asar):
-        header, _, self.base = read_asar(asar)
-        self.asar = asar
-        self.nodes = {path.rsplit("/", 1)[1]: node for path, node in walk(header)
-                      if path.startswith("webview/assets/") and path.endswith(".js") and "unpacked" not in node}
-        self.raw, self.text, self.changed = {}, {}, []
-
-    def __getitem__(self, name):
-        if name not in self.text:
-            self.text[name] = self.bytes(name).decode("utf-8")
-        return self.text[name]
-
-    def __setitem__(self, name, text):
-        self.text[name] = text
-        if name not in self.changed:
-            self.changed.append(name)
-
-    def bytes(self, name):
-        if name not in self.raw:
-            self.raw[name] = read_file(self.asar, self.base, self.nodes[name])
-        return self.raw[name]
-
-    def find(self, pattern, what, hint):
-        """The one match of pattern in any chunk, as (chunk, match). Only chunks containing hint are searched."""
-        found = [(name, m) for name in self.nodes if hint.encode() in self.bytes(name)
-                 for m in re.finditer(pattern, self[name])]
-        if len(found) != 1:
-            raise PatchError(f"{what}: expected 1 match, found {len(found)}")
-        if MARKER.encode() in self.bytes(found[0][0]):
-            raise PatchError(f"{found[0][0]} is already patched")
-        return found[0]
+def export_map(b, mod):
+    """(match of the first export call or None, {local or `x.y`: exported name}) from mod's `require.d(exports, ...)`."""
+    text, names, first = b.text(mod), {}, None
+    for m in re.finditer(rf"{re.escape(mod.require)}\.d\({re.escape(mod.exports)},(\{{[^}}]*\}})(?:,(\{{[^}}]*\}}))?\)", text):
+        first = first or m
+        for part in m.group(1)[1:-1].split(","):
+            key, _, value = part.partition(":()=>")
+            names.setdefault(value, key.strip('"'))
+        for part in (m.group(2) or "{}")[1:-1].split(","):
+            key, _, value = part.partition(":")
+            if value:
+                names.setdefault(value, key.strip('"'))
+    return first, names
 
 
-def exports(text):
-    """The chunk's export statement and its {exported name: local name} map."""
-    m = re.search(r"export\{([^}]*)\};?\s*(//# sourceMappingURL=[^\n]*)?\s*$", text)
-    if m is None:
-        raise PatchError("export list not found")
-    names = {}
-    for part in m.group(1).split(","):
-        bits = part.strip().split(" as ")
-        names[bits[-1]] = bits[0]
-    return m, names
+def export(b, mod, local, name=None):
+    """The name mod exports local as, adding a getter export if it has none."""
+    first, names = export_map(b, mod)
+    if local in names:
+        return names[local]
+    name = name or f"__qc_{local}"
+    text = b.text(mod)
+    if first is not None:
+        at = first.start(1) + 1
+        b.set_text(mod, text[:at] + f"{name}:()=>{local}," + text[at:])
+    else:
+        at = text.index("{") + 1
+        b.set_text(mod, text[:at] + f"{mod.require}.d({mod.exports},{{{name}:()=>{local}}});" + text[at:])
+    return name
 
 
-def imports(text):
-    """{local alias: (chunk, exported name)} for the chunk's static imports of other chunks."""
-    names = {}
-    for m in re.finditer(r'import\{([^}]*)\}from"\./([^"]+)";', text):
-        for part in m.group(1).split(","):
-            bits = part.strip().split(" as ")
-            names[bits[-1]] = (m.group(2), bits[0])
-    return names
+def ref(b, mod, token):
+    """(module id, export name) for a name as written in mod: `x.y` (a member of another module) or a local."""
+    if "." in token:
+        var, member = token.split(".", 1)
+        return module_var(b, mod, var), member
+    return mod.id, export(b, mod, token)
 
 
-def canonical(bundle, chunk, name):
-    """(chunk, local name) where a name used in chunk is actually defined, following its imports."""
-    for _ in range(8):
-        imported = imports(bundle[chunk]).get(name)
-        if imported is None:
-            return chunk, name
-        chunk, exported = imported
-        name = exports(bundle[chunk])[1].get(exported)
-        if name is None:
-            raise PatchError(f"{chunk} doesn't export {exported}")
-    raise PatchError(f"import chain for {name} is too long")
+def prelude(b, mod, core_id):
+    """Give mod a module-level loader alias and a guarded accessor for the patched Quick Chat module."""
+    text = b.text(mod)
+    if "__qcReq" not in text:
+        at = text.index("{") + 1
+        b.set_text(mod, text[:at] + f"var __qcReq={mod.require};function __qcCore(){{try{{return __qcReq(\"{core_id}\")}}"
+                   "catch{return null}}" + text[at:])
 
 
-def bind(bundle, target, chunk, local):
-    """A name code in target can use for local (defined in chunk), exporting and importing it if needed.
-
-    Only imports target already has are extended, so no chunk starts loading earlier than it did."""
-    if target == chunk:
-        return local
-    m, names = exports(bundle[chunk])
-    exported = next((e for e, l in names.items() if l == local), None)
-    if exported is None:
-        exported = local if local.startswith("__qc") else f"__qc_{local}"
-        src = bundle[chunk]
-        bundle[chunk] = src[:m.start(1)] + f"{local} as {exported}," + src[m.start(1):]
-    src = bundle[target]
-    known = imports(src)
-    alias = next((a for a, ref in known.items() if ref == (chunk, exported)), None)
-    if alias is not None:
-        return alias
-    imp = re.search(r'import\{([^}]*)\}from"\./' + re.escape(chunk) + r'";', src)
-    if imp is None:
-        raise PatchError(f"{target} doesn't import {chunk}")
-    alias = exported if exported.startswith("__qc") else f"__qc_{exported}"
-    while alias in known:
-        alias += "_"
-    bundle[target] = src[:imp.start(1)] + f"{exported} as {alias}," + src[imp.start(1):]
-    return alias
+def req(mid, name):
+    return f'__qcReq("{mid}").{name}'
 
 
 # ------------------------------------------------------------------ patterns
 
-# The toggle's header. Its body shows the panel with show(e,r.hasConversation), written as an if chain up
-# to 26.1021 and as a nested ternary since 26.1027, so the show call is looked up separately.
-TOGGLE_RE = (rf"function ({I})\(e,t=\{{\}}\)\{{if\(!e\.get\(({I}),\{{name:`chatgpt\.quick-chat`\}}\)\.isCapable\)return;"
-             rf"let n=e\.get\(({I})\),r=e\.get\(({I})\);")
+QC = r'\{name:"chatgpt\.quick-chat"\}'
+
+# The toggle's header. The call that shows the panel, show(e,r.hasConversation), is looked up in its body.
+TOGGLE_RE = rf"function ({I})\(e,t=\{{\}}\)\{{if\(!e\.get\(({M}),{QC}\)\.isCapable\)return;let n=e\.get\(({I})\),r=e\.get\(({I})\);"
+
+# The new-session function opens the session with an inline function; its default supplies the id generator.
+OPENER_RE = (rf"\((?P<fn>function\(e,\{{conversationId:t=\(0,(?P<newid>{M})\)\(\),contextSourceThread:n=null,"
+             rf"projectId:r=null,projectName:i=null,preservePreviousSession:a=!1\}}=\{{\}}\)\{{[^{{}}]*(?:\{{[^{{}}]*\}}[^{{}}]*)*\}})\)\(e,")
+
+SUBMIT_RE = (rf"let {I}=e\.get\((?P<model>{M}),t\);e\.set\((?P<submitting>{M}),t,!0\);try\{{let (?P<hints>{I})={I}\?\?"
+             rf"e\.get\({M},t\),{I}=null=={I}\|\|0===(?P<prompt>{I})\.trim\(\)\.length\?void 0:\(0,(?P<build>{M})\)\(\{{"
+             rf"messageMetadata:{I},oneTurnDeveloperInstructions:{I},prompt:(?P=prompt),systemHints:(?P=hints)\}}\),"
+             rf"{I}=await \(0,(?P<send>{M})\)\(e,\{{conversationId:t,")
+
+# Pending prompt (null) and pending markdown (false) atoms, around a derived "last user message" atom, then lists.
+PENDING_RE = (rf"(?P<prompt>{I})=\(0,(?P<f>{M})\)\((?P<s>{M}),e=>null\),(?:{I}=\(0,{M}\)\((?P=s),\(e,\{{get:t\}}\)=>[^;]*?\),)?"
+              rf"(?P<markdown>{I})=\(0,(?P=f)\)\((?P=s),e=>!1\),{I}=\(0,(?P=f)\)\((?P=s),e=>\[\]\),"
+              rf"{I}=\(0,(?P=f)\)\((?P=s),e=>\[\]\),{I}=\(0,(?P=f)\)\((?P=s),e=>\[\]\)")
+
+SERVER_ID_RE = (rf"(?<![\w$.])({I})=\(0,{M}\)\({M},\(e,\{{get:t\}}\)=>null==e\?null:\(0,{M}\)\(e\)\?t\({M},e\):"
+                rf"\(0,{M}\)\(e\)\)")
+
+STREAMING_RE = (rf"(?<![\w$.])({I})=\(0,{M}\)\({M},\(e,\{{get:t\}}\)=>\{{let n=\(0,{M}\)\(t,e\);if\(null==n\|\|!{I}\("
+                rf"t\({I},e\)\)\)return!1;let r=t\({M},n\);return null==r\|\|t\({M},n\)!==r\}}\)")
+
+PLAIN_TEXT_RE = (rf"function ({I})\(({I}),\{{includeImages:{I}=!1,includeCollapsedContent:{I}=!1[^}}]*\}}=\{{\}}\)\{{"
+                 rf"let ({I})=\2\.ownerDocument\.createRange\(\);return \3\.selectNodeContents\(\2\)")
 
 # The Quick Chat host component, up to and including its useLayoutEffect call.
-HOST_RE = (rf"\{{surfaceOwner:(?P<owner>{I})\}}=(?P<props>{I}),(?P<store>{I})={I}\({I}\),(?P<k>{I});"
-           rf"(?P<t>{I})\[0\]===Symbol\.for\(`react\.memo_cache_sentinel`\)\?\((?P=k)=\{{name:`chatgpt\.quick-chat`\}},"
-           rf"(?P=t)\[0\]=(?P=k)\):(?P=k)=(?P=t)\[0\];let (?P<a>{I})=(?P<useFamily>{I})\((?P<bo>{I}),(?P=k)\)\.isCapable,"
-           rf"(?P<o>{I})=(?P<useValue>{I})\((?P<disabled>{I})\),(?P<s>{I})=(?P=a)&&!(?P=o),(?P<c>{I}),(?P<l>{I});"
-           rf"if\((?P=t)\[1\]!==(?P=s)\|\|(?P=t)\[2\]!==(?P=store)\?\((?P=c)=\(\)=>\{{(?P=s)\|\|(?P<close>{I})\((?P=store)\)\}},"
-           rf"(?P=l)=\[(?P=s),(?P=store)\],(?P=t)\[1\]=(?P=s),(?P=t)\[2\]=(?P=store),(?P=t)\[3\]=(?P=c),(?P=t)\[4\]=(?P=l)\):"
-           rf"\((?P=c)=(?P=t)\[3\],(?P=l)=(?P=t)\[4\]\),\(0,(?P<react>{I})\.useLayoutEffect\)\((?P=c),(?P=l)\),")
-
-SUBMIT_RE = (rf"let {I}=(?P<e>{I})\.get\((?P<model>{I}),(?P<t>{I})\);(?P=e)\.set\((?P<submitting>{I}),(?P=t),!0\);try\{{"
-             rf"let (?P<hints>{I})={I}\?\?(?P=e)\.get\({I},(?P=t)\),{I}={I}==null\|\|(?P<prompt>{I})\.trim\(\)\.length===0\?"
-             rf"void 0:(?P<build>{I})\(\{{messageMetadata:{I},oneTurnDeveloperInstructions:{I},prompt:(?P=prompt),"
-             rf"systemHints:(?P=hints)\}}\),{I}=await (?P<send>{I})\((?P=e),\{{conversationId:(?P=t),")
-
-# Pending prompt (null) and pending markdown (false) atoms, followed by three list atoms. 26.1021 inserted a
-# derived atom between the first two.
-PENDING_RE = (rf"(?P<prompt>{I})=(?P<f>{I})\((?P<s>{I}),e=>null\),(?:{I}={I}\((?P=s),\(e,\{{get:t\}}\)=>[^;]*?\),)?"
-              rf"(?P<markdown>{I})=(?P=f)\((?P=s),e=>!1\),{I}=(?P=f)\((?P=s),e=>\[\]\),{I}=(?P=f)\((?P=s),e=>\[\]\),"
-              rf"{I}=(?P=f)\((?P=s),e=>\[\]\)")
+HOST_RE = (rf"\{{surfaceOwner:(?P<owner>{I})\}}=(?P<props>{I}),(?P<store>{I})=\(0,{M}\)\({M}\);"
+           rf"(?P<t>{I})\[0\]===Symbol\.for\(\"react\.memo_cache_sentinel\"\)\?\((?P<k>{I})={QC},(?P=t)\[0\]=(?P=k)\):"
+           rf"(?P=k)=(?P=t)\[0\];let (?P<a>{I})=\(0,{M}\)\((?P<bo>{M}),(?P=k)\)\.isCapable,(?P<o>{I})=\(0,{M}\)\("
+           rf"(?P<disabled>{M})\),(?P<s>{I})=(?P=a)&&!(?P=o);return\((?P=t)\[1\]!==(?P=s)\|\|(?P=t)\[2\]!==(?P=store)\?"
+           rf"\((?P<c>{I})=\(\)=>\{{(?P=s)\|\|\(0,{M}\)\((?P=store)\)\}},(?P<l>{I})=\[(?P=s),(?P=store)\],"
+           rf"(?P=t)\[1\]=(?P=s),(?P=t)\[2\]=(?P=store),(?P=t)\[3\]=(?P=c),(?P=t)\[4\]=(?P=l)\):\((?P=c)=(?P=t)\[3\],"
+           rf"(?P=l)=(?P=t)\[4\]\),\(0,(?P<react>{I})\.useLayoutEffect\)\((?P=c),(?P=l)\),")
 
 # The shared selection menu calls useIntl() right after defaulting its terminology prop.
-USE_INTL_RE = rf"{I}=({I})===void 0\?`task`:\1,{I}=({I})\(\),\[{I},{I}\]=\(0,{I}\.useState\)"
+USE_INTL_RE = rf"{I}=void 0===({I})\?\"task\":\1,{I}=\(0,({M})\)\(\),\[{I},{I}\]=\(0,{I}\.useState\)"
 
-# The Codex thread selection overlay. Local names are captured rather than assumed, since the minifier
-# reassigns them between releases.
-OUTER_RE = (rf"function {I}\((?P<props>{I})\)\{{let (?P<t>{I})=\(0,(?P<cache>{I})\.c\)\((?P<size>\d+)\),"
+# The Codex thread selection overlay; rspack hoists the component's temporaries into the leading `let`.
+OUTER_RE = (rf"function {I}\((?P<props>{I})\)\{{let (?:{I},)*(?P<t>{I})=\(0,(?P<cache>{I})\.c\)\((?P<size>\d+)\),"
             rf"\{{actions:{I},canOpenSideChat:{I},scopeToThread:{I},targetSelector:(?P<sel>{I})\}}=(?P=props),"
-            rf"(?P<store>{I})={I}\({I}\),")
+            rf"(?P<store>{I})=\(0,{M}\)\({M}\),")
 
 
-# --------------------------------------------------- Quick Chat internals
+# ------------------------------------------------------- Quick Chat state
 
-def patch_core(bundle):
-    core, m = bundle.find(TOGGLE_RE, "quick chat toggle", "chatgpt.quick-chat")
-    src = bundle[core]
-    n = {}
-    n["toggle"], n["Bo"], n["session"] = m.group(1), m.group(2), m.group(3)
-    n["show"] = one(rf"({I})\(e,r\.hasConversation\)", src[m.end():src.index("}function ", m.end())],
-                    "quick chat toggle's show call").group(1)
+def patch_core(b):
+    [(core, m)] = b.find(TOGGLE_RE, "quick chat toggle", 'chatgpt.quick-chat"}).isCapable)return;let n=')
+    src = b.text(core)
+    toggle, bo, session = m.group(1), m.group(2), m.group(3)
+    body = src[m.end() - core.start:src.index("}function ", m.end() - core.start)]
+    show = one(rf"({I})\(e,r\.hasConversation\)", body, "quick chat toggle's show call").group(1)
+    visible = one(rf"function {re.escape(show)}\(e,t\)\{{let n=!e\.get\(({I})\);e\.set\(\1,!0\),e\.set\({I},n&&!t\?"
+                  rf"\"welcome\":\"recent\"\),e\.set\(({I}),!0\)\}}", src, "quick chat visibility atom").group(2)
+    opener = one(OPENER_RE, src, "quick chat session opener")
+    mark = one(rf"function ({I})\(e,t,n=\{{\}}\)\{{if\(!e\.get\({re.escape(bo)},{QC}\)\.isCapable\)return;let r=e\.get\("
+               rf"{re.escape(session)}\);r\?\.conversationId!==t\|\|r\.hasConversation\|\|", src,
+               "quick chat conversation-started").group(1)
+    close = one(rf"function ({I})\(e,t=\{{\}}\)\{{\(0,{M}\)\(e,0\);let n=e\.get\({re.escape(visible)}\),r=e\.get\("
+                rf"{re.escape(session)}\)", src, "quick chat close").group(1)
+    context = one(rf"async function ({I})\(e,\{{isBackgroundSubagentsEnabled:t,sourceThread:n,signal:r\}}\)\{{let i="
+                  rf"\(await {I}\(e,\{{sourceThread:n,signal:r,isBackgroundSubagentsEnabled:t,markdownLimit:", src,
+                  "Codex context builder").group(1)
+    thread_host = one(rf"\{{threadId:({I}),hostId:{I}\.get\(({M}),\1\)\}}", src, "thread host atom").group(2)
 
-    m = one(r"function " + re.escape(n["show"]) + r"\(e,t\)\{let n=!e\.get\(([\w$]+)\);e\.set\(\1,!0\),"
-            r"e\.set\([\w$]+,n&&!t\?`welcome`:`recent`\),e\.set\(([\w$]+),!0\)\}", src, "quick chat visibility atom")
-    n["visible"] = m.group(2)
+    table = {"TOGGLE": toggle, "BO": bo, "SESSION": session, "SHOW": show, "VISIBLE": visible, "CLOSE": close,
+             "OPENSESSION": opener["fn"], "NEWID": opener["newid"], "MARKSTARTED": mark, "CODEXCONTEXT": context,
+             "THREADHOST": thread_host}
 
-    m = one(r"function ([\w$]+)\(e,\{conversationId:t=([\w$]+)\(\),contextSourceThread:n=null,projectId:r=null,"
-            r"projectName:i=null,preservePreviousSession:a=!1\}=\{\}\)", src, "quick chat session opener")
-    n["openSession"], n["newConversationId"] = m.group(1), m.group(2)
+    [(mod, m)] = b.find(SUBMIT_RE, "ChatGPT submit helper", "oneTurnDeveloperInstructions:")
+    for key, group in (("MODELSETTINGS", "model"), ("SUBMITTING", "submitting"), ("BUILDMESSAGES", "build"),
+                       ("SEND", "send")):
+        table[key] = req(*ref(b, mod, m[group]))
+    [(mod, m)] = b.find(PENDING_RE, "pending prompt atoms", 'findLast(e=>"user"===e.author.role')
+    table["PENDINGPROMPT"], table["PENDINGMARKDOWN"] = req(*ref(b, mod, m["prompt"])), req(*ref(b, mod, m["markdown"]))
+    [(mod, m)] = b.find(SERVER_ID_RE, "server conversation id atom", "(e,{get:t})=>null==e?null:")
+    table["SERVERID"] = req(*ref(b, mod, m.group(1)))
+    [(mod, m)] = b.find(STREAMING_RE, "streaming atom", "return null==r||t(")
+    table["STREAMING"] = req(*ref(b, mod, m.group(1)))
+    [(mod, m)] = b.find(PLAIN_TEXT_RE, "plain text extractor", "includeCollapsedContent:")
+    table["PLAINTEXT"] = req(*ref(b, mod, m.group(1)))
 
-    m = one(r"function ([\w$]+)\(e,t,n=\{\}\)\{if\(!e\.get\(" + re.escape(n["Bo"]) +
-            r",\{name:`chatgpt\.quick-chat`\}\)\.isCapable\)return;let r=e\.get\(" + re.escape(n["session"]) +
-            r"\);r\?\.conversationId!==t\|\|r\.hasConversation\|\|", src, "quick chat conversation-started")
-    n["markStarted"] = m.group(1)
-
-    m = one(SUBMIT_RE, src, "ChatGPT submit helper")
-    n["modelSettings"], n["submitting"], n["buildMessages"], n["send"] = m["model"], m["submitting"], m["build"], m["send"]
-    send_def = one(r"(?:async )?function " + re.escape(n["send"]) + r"\(", src, "send() definition")
-    build_def = one(r"function " + re.escape(n["buildMessages"]) + r"\(", src, "buildMessages() definition")
-
-    m = one(PENDING_RE, src, "pending prompt atoms")
-    n["pendingPrompt"], n["pendingMarkdown"] = m["prompt"], m["markdown"]
-    pending_pos = m.start()
-
-    m = one(r"async function ([\w$]+)\(e,\{isBackgroundSubagentsEnabled:t,sourceThread:n,signal:r\}\)\{let i=\(await "
-            r"[\w$]+\(e,\{sourceThread:n,signal:r,isBackgroundSubagentsEnabled:t,markdownLimit:", src,
-            "Codex context builder")
-    n["codexContext"] = m.group(1)
-    context_pos = m.start()
-
-    m = one(r"return n==null\?null:\{threadId:n,hostId:e\.get\(([\w$]+),n\)\}\}", src, "thread host atom")
-    n["threadHost"] = m.group(1)
-
-    m = one(r"([\w$]+)=[\w$]+\([\w$]+,\(e,\{get:t\}\)=>e==null\?null:[\w$]+\(e\)\?t\([\w$]+,e\):[\w$]+\(e\)\)",
-            src, "server conversation id atom")
-    n["serverId"] = m.group(1)
-    server_pos = m.start()
-
-    m = one(r"([\w$]+)=[\w$]+\([\w$]+,\(e,\{get:t\}\)=>\{let n=[\w$]+\(t,e\);if\(n==null\|\|!"
-            r"[\w$]+\(t\([\w$]+,e\)\)\)return!1;let r=t\([\w$]+,n\);return r==null\|\|t\([\w$]+,n\)!==r\}\)",
-            src, "streaming atom")
-    n["streaming"] = m.group(1)
-
-    # 26.1027 added a chatGptImageMode option, so later options and the local names are allowed to vary.
-    m = one(rf"function ({I})\(({I}),\{{includeImages:{I}=!1,includeCollapsedContent:{I}=!1[^}}]*\}}=\{{\}}\)\{{"
-            rf"let ({I})=\2\.ownerDocument\.createRange\(\);return \3\.selectNodeContents\(\2\)", src, "plain text extractor")
-    n["plainText"] = m.group(1)
-    plain_pos = m.start()
-
-    toasts = re.findall(r"\.get\(([\w$]+)\)\.danger\(", src)
+    # The toast atom, as most modules in this chunk use it.
+    toasts = collections.Counter(ref(b, b.module_at(core.chunk, t.start()), t.group(1))
+                                 for t in re.finditer(rf"\.get\(({M})\)\.danger\(", b.source(core.chunk)))
     if not toasts:
         raise PatchError("toast atom not found")
-    n["toast"] = max(set(toasts), key=toasts.count)
+    table["TOAST"] = req(*toasts.most_common(1)[0][0])
 
-    session_pos = one(r"[,(]" + re.escape(n["session"]) + r"=", src, "session atom").start()
-    submitting_pos = one(r"[,(]" + re.escape(n["submitting"]) + r"=", src, "submitting atom").start()
-    inits = sorted({
-        init_containing(src, session_pos),
-        init_containing(src, submitting_pos),
-        init_containing(src, server_pos),
-        init_containing(src, pending_pos),
-        init_after(src, send_def.end()),
-        init_after(src, build_def.end()),
-        init_after(src, context_pos),
-        init_after(src, plain_pos),
-    })
-
-    # The host component's capability gate supplies the hooks for __qcCan and the panel's close function.
-    host, h = bundle.find(HOST_RE, "quick chat host", "surfaceOwner")
-    if canonical(bundle, host, h["bo"]) != canonical(bundle, core, n["Bo"]):
+    # The host's capability gate also checks whether Quick Chat is disabled.
+    [(host, h)] = b.find(HOST_RE, "quick chat host", "surfaceOwner")
+    if ref(b, host, h["bo"]) != ref(b, core, bo):
         raise PatchError("quick chat host: capability atom doesn't match the toggle's")
-    for key in ("useFamily", "useValue", "disabled", "close"):
-        n[key] = bind(bundle, core, *canonical(bundle, host, h[key]))
+    table["DISABLED"] = req(*ref(b, host, h["disabled"]))
 
-    js = r"""
-;/* codex-more-details-restore: port of 26.1002.52244 selected-text Quick Chat */
-var __qcPend=[],__qcCapKey={name:`chatgpt.quick-chat`};
-function __qcCan(){return USEFAMILY(BO,__qcCapKey).isCapable&&!USEVALUE(DISABLED)}
+    js = r"""var __qcReq=REQUIRE,__qcT,__qcPend=[],__qcCapKey={name:`chatgpt.quick-chat`};/* codex-more-details: port of 26.1002.52244 selected-text Quick Chat */
+function __qcN(){return __qcT??=TABLE}
+function __qcCan(e){try{return e.get(BO,__qcCapKey).isCapable&&!e.get(DISABLED)}catch{return!1}}
 function __qcTrunc(e,t){let L=4e4,R=`\n\n… Codex conversation truncated …\n\n`,Z=`\n\n… selected text shown above …\n\n`;if(e.length<=L)return e;let n=e.indexOf(t);if(n===-1){let r=L-R.length,i=Math.floor(r/2),a=r-i;return`${e.slice(0,i)}${R}${e.slice(-a)}`}let r=n+t.length;return`${e.slice(Math.max(0,n-19983),n)}${Z}${e.slice(r,r+19984)}`}
 function __qcBusy(e,t){return e(SUBMITTING,t)||e(SERVERID,t)==null&&e(STREAMING,t)}
 async function __qcPrep(e,t,n){let r=t.selectedText.trim();if(r.length===0)return null;let i=__qcTrunc(t.selectedMessageText.trim()||r,r),o=[...await CODEXCONTEXT(e,{isBackgroundSubagentsEnabled:t.isBackgroundSubagentsEnabled,sourceThread:{threadId:t.sourceConversationId,hostId:e.get(THREADHOST,t.sourceConversationId)}}),`The user is referring to this in particular:\n${r}\n\n---\n\nThe selection appears in the following source message. Prioritize this source message over the broader conversation context:\n\n${i}`],a=e.get(MODELSETTINGS,n);return{model:a.slug,thinkingEffort:a.thinkingEffort,userCompletionMessages:BUILDMESSAGES({extraDeveloperInstructions:o,messageMetadata:{is_visually_hidden_from_conversation:!0,targeted_reply:r,targeted_reply_label:t.targetedReplyLabel},prompt:t.prompt})}}
@@ -346,45 +397,44 @@ async function __qcStart(e,t){if(!e.get(BO,{name:`chatgpt.quick-chat`}).isCapabl
 var __qcKeyScopes=[];
 function __qcBindKeys(e,n,s){if(n!=null||!s)return;__qcKeyScopes.push(e);window.__qcKeysBound||(window.__qcKeysBound=!0,window.addEventListener(`keydown`,__qcOnKey,!0));return()=>{let t=__qcKeyScopes.lastIndexOf(e);t>=0&&__qcKeyScopes.splice(t,1)}}
 function __qcOnKey(t){if(t.repeat||t.code!==`Space`||t.ctrlKey)return;let m=t.metaKey&&t.shiftKey&&!t.altKey,o=t.altKey&&!t.metaKey&&!t.shiftKey;if(!m&&!o)return;let e=__qcKeyScopes[__qcKeyScopes.length-1];if(e==null)return;t.preventDefault(),t.stopPropagation();try{e.get(VISIBLE)&&e.get(SESSION)!=null?CLOSE(e):TOGGLE(e,{})}catch(n){console.error(`[more-details] Quick Chat shortcut failed`,n)}}
-function __qcMDRun(e,{selectedText:s,target:l,sourceConversationId:c,intl:I}){if(c==null)return;try{INITS}catch(e){console.warn(`[more-details] init`,e)}let m=I.formatMessage({id:`selectedTextOverlay.quickChatPrompt`,defaultMessage:`Tell me more about this`,description:`Prompt sent in Quick Chat when asking about selected text`}),b=I.formatMessage({id:`chatGptConversation.targetedReply.selectedText`,defaultMessage:`Selected text`,description:`Label shown above a Quick Chat message that replies to text selected in a Codex conversation`}),x=null;try{x=l==null?null:PLAINTEXT(l)}catch{}__qcStart(e,{isBackgroundSubagentsEnabled:!0,prompt:m,selectedMessageText:x?.plainText??l?.innerText??``,selectedText:s,sourceConversationId:c,targetedReplyLabel:b}).catch(n=>{console.error(`[Composer] selected text Quick Chat failed`,n);try{e.get(TOAST).danger(I.formatMessage({id:`selectedTextOverlay.quickChatError`,defaultMessage:`Failed to start chat`,description:`Toast shown when asking about selected text in chat fails`}),{errorAnalytics:{toastId:`selectedTextOverlay.quickChatError`}})}catch{}})}
+function __qcMDRun(e,{selectedText:s,target:l,sourceConversationId:c,intl:I}){if(c==null)return;let m=I.formatMessage({id:`selectedTextOverlay.quickChatPrompt`,defaultMessage:`Tell me more about this`,description:`Prompt sent in Quick Chat when asking about selected text`}),b=I.formatMessage({id:`chatGptConversation.targetedReply.selectedText`,defaultMessage:`Selected text`,description:`Label shown above a Quick Chat message that replies to text selected in a Codex conversation`}),x=null;try{x=l==null?null:PLAINTEXT(l)}catch{}__qcStart(e,{isBackgroundSubagentsEnabled:!0,prompt:m,selectedMessageText:x?.plainText??l?.innerText??``,selectedText:s,sourceConversationId:c,targetedReplyLabel:b}).catch(n=>{console.error(`[Composer] selected text Quick Chat failed`,n);try{e.get(TOAST).danger(I.formatMessage({id:`selectedTextOverlay.quickChatError`,defaultMessage:`Failed to start chat`,description:`Toast shown when asking about selected text in chat fails`}),{errorAnalytics:{toastId:`selectedTextOverlay.quickChatError`}})}catch{}})}
 """
-    subs = {
-        "USEFAMILY": n["useFamily"], "USEVALUE": n["useValue"], "DISABLED": n["disabled"], "BO": n["Bo"],
-        "SUBMITTING": n["submitting"], "SERVERID": n["serverId"], "STREAMING": n["streaming"],
-        "CODEXCONTEXT": n["codexContext"], "THREADHOST": n["threadHost"], "MODELSETTINGS": n["modelSettings"],
-        "BUILDMESSAGES": n["buildMessages"], "SESSION": n["session"], "NEWID": n["newConversationId"],
-        "PENDINGMARKDOWN": n["pendingMarkdown"], "PENDINGPROMPT": n["pendingPrompt"],
-        "OPENSESSION": n["openSession"], "SHOW": n["show"], "MARKSTARTED": n["markStarted"], "SEND": n["send"],
-        "PLAINTEXT": n["plainText"], "TOAST": n["toast"], "VISIBLE": n["visible"], "CLOSE": n["close"],
-        "TOGGLE": n["toggle"], "INITS": ",".join(f"{i}()" for i in inits),
-    }
-    js = re.sub(r"\b(" + "|".join(sorted(subs, key=len, reverse=True)) + r")\b", lambda m: subs[m.group(1)], js)
-
-    src = bundle[core]
-    exp, _ = exports(src)
-    bundle[core] = (src[:exp.start()] + js + "\n" + src[exp.start():exp.start(1)]
-                    + "__qcMDRun as __qcMDRun,__qcCan as __qcCan,__qcBindKeys as __qcBindKeys," + src[exp.start(1):])
+    # Everything the port calls goes through one table built at module scope, so the port's own locals can't
+    # shadow a module name (single letters like `a` are both).
+    js = re.sub(r"\b(" + "|".join(sorted(table, key=len, reverse=True)) + r")\b", lambda m: f"(0,__qcN().{m.group(1)})", js)
+    js = js.replace("TABLE", "{" + ",".join(f"{k}:{v}" for k, v in table.items()) + "}").replace("REQUIRE", core.require)
+    text = b.text(core)
+    at = text.index("{") + 1
+    b.set_text(core, text[:at] + js + text[at:])
+    for name in ("__qcMDRun", "__qcCan", "__qcBindKeys"):
+        export(b, core, name, name)
 
     # Register the shortcut while the host is mounted.
-    bind_keys = bind(bundle, host, core, "__qcBindKeys")
-    src = bundle[host]
-    h = one(HOST_RE, src, "quick chat host")
+    prelude(b, host, core.id)
+    text = b.text(host)
+    h = one(HOST_RE, text, "quick chat host")
     args = f"{h['store']},{h['owner']},{h['s']}"
-    bundle[host] = src[:h.end()] + f"(0,{h['react']}.useEffect)(()=>{bind_keys}({args}),[{args}])," + src[h.end():]
-    return core, n
+    b.set_text(host, text[:h.end()] + f"(0,{h['react']}.useEffect)(()=>__qcCore()?.__qcBindKeys({args}),[{args}]),"
+               + text[h.end():])
+    return core, table
 
 
-# --------------------------------------------------- selection overlays
+# ---------------------------------------------------- selection overlays
 
-def patch_overlays(bundle, core):
-    menu, m = bundle.find(USE_INTL_RE, "useIntl in selection menu", "conversationTerminology")
-    chunk, _ = bundle.find(OUTER_RE, "Codex selection overlay", "canOpenSideChat")
-    use_intl = bind(bundle, chunk, *canonical(bundle, menu, m.group(2)))
-    md_run = bind(bundle, chunk, core, "__qcMDRun")
-    can = bind(bundle, chunk, core, "__qcCan")
+def patch_overlays(b, core):
+    intl = {ref(b, mod, m.group(2)) for mod, m in b.find(USE_INTL_RE, "useIntl in selection menu",
+                                                       "conversationTerminology:", count=None)}
+    if len(intl) != 1:
+        raise PatchError(f"useIntl in selection menu: expected 1 hook, found {sorted(intl)}")
+    use_intl = req(*intl.pop())
+    for mod, _ in b.find(OUTER_RE, "Codex selection overlay", "canOpenSideChat:", count=None):
+        prelude(b, mod, core.id)
+        patch_overlay(b, mod, use_intl)
 
+
+def patch_overlay(b, mod, use_intl):
     # Codex thread overlay: compute an onMoreDetails handler and pass it down.
-    src = bundle[chunk]
+    src = b.text(mod)
     q = one(OUTER_RE, src, "Codex selection overlay")
     t, cache, size, sel, store = q["t"], q["cache"], int(q["size"]), q["sel"], q["store"]
     T, S, A = re.escape(t), re.escape(store), re.escape(sel)
@@ -394,7 +444,7 @@ def patch_overlays(bundle, core):
     if len(reacts) != 1:
         raise PatchError(f"React namespace: expected 1 name, found {sorted(reacts)}")
     react = reacts.pop()
-    thread_id = one(rf"{T}\[2\]==={S}\?(?P<d>{I})={T}\[3\]:\((?P=d)=(?P<id>{I})\({S}\),{T}\[2\]={S},{T}\[3\]=(?P=d)\)",
+    thread_id = one(rf"{T}\[2\]!=={S}\?\((?P<d>{I})=\(0,(?P<id>{M})\)\({S}\),{T}\[2\]={S},{T}\[3\]=(?P=d)\):(?P=d)={T}\[3\]",
                     body, "thread id")["id"]
     jm = one(rf"{T}\[13\]!==(?P<h>{I})\|\|{T}\[14\]!==(?P<g>{I})\|\|{T}\[15\]!==(?P<u>{I})\|\|{T}\[16\]!=={A}\?"
              rf"\((?P<v>{I})=\(0,(?P<jsx>{I})\.jsx\)\((?P<inner>{I}),\{{onAddResponseTextAnnotation:(?P=h),"
@@ -408,50 +458,50 @@ def patch_overlays(bundle, core):
     ) + body[jm.end():]
     cut = q.end() - q.start()
     body = body[:cut] + (
-        f"__qi={use_intl}(),__qc={can}(),__md=(0,{react}.useMemo)(()=>__qc?(__s,__l)=>{md_run}({store},"
-        f"{{selectedText:__s,target:__l,sourceConversationId:{thread_id}({store}),intl:__qi}}):void 0,[{store},__qi,__qc]),"
+        f"__qi={use_intl}(),__qc=__qcCore()?.__qcCan({store})??!1,__md=(0,{react}.useMemo)(()=>__qc?(__s,__l)=>"
+        f"__qcCore()?.__qcMDRun({store},{{selectedText:__s,target:__l,sourceConversationId:(0,{thread_id})({store}),"
+        f"intl:__qi}}):void 0,[{store},__qi,__qc]),"
     ) + body[cut:]
     body = body.replace(f"(0,{cache}.c)({size})", f"(0,{cache}.c)({size + 1})", 1)
-    bundle[chunk] = src[:q.start()] + body + src[q_end:]
+    src = src[:q.start()] + body + src[q_end:]
 
     # Inner overlay: accept onMoreDetails and hand it to the shared selection menu.
-    chunk, inner = canonical(bundle, chunk, inner)
-    src = bundle[chunk]
-    e = one(rf"function {re.escape(inner)}\((?P<props>{I})\)\{{let (?P<t>{I})=\(0,(?P<cache>{I})\.c\)\((?P<size>\d+)\),"
-            rf"\{{onAddResponseTextAnnotation:(?P<n>{I}),onOpenSideChat:(?P<r>{I}),targetContainerRefs:(?P<i>{I}),"
-            rf"targetSelector:(?P<a>{I})\}}=(?P=props),(?P<o>{I})=(?P<zoom>{I})\(\);if\((?P=n)==null&&(?P=r)==null\)"
-            rf"return null;let (?P<s>{I});(?P=t)\[0\]!==(?P=n)\|\|(?P=t)\[1\]!==(?P=r)\|\|(?P=t)\[2\]!==(?P=o)\?\((?P=s)=",
-            src, "inner overlay")
-    props, t, n, r, o, s, size = e["props"], e["t"], e["n"], e["r"], e["o"], e["s"], int(e["size"])
-    e_end = src.index("}function ", e.end())
+    e = one(rf"function {re.escape(inner)}\((?P<props>{I})\)\{{let (?:{I},)*(?P<t>{I})=\(0,(?P<cache>{I})\.c\)\((?P<size>\d+)\),"
+            rf"\{{onAddResponseTextAnnotation:(?P<n>{I}),onOpenSideChat:(?P<r>{I}),targetContainerRefs:{I},targetSelector:{I}\}}"
+            rf"=(?P=props),(?P<o>{I})=\(0,{M}\)\(\);return null==(?P=n)&&null==(?P=r)\?null:\((?P=t)\[0\]!==(?P=n)\|\|"
+            rf"(?P=t)\[1\]!==(?P=r)\|\|(?P=t)\[2\]!==(?P=o)\?\((?P<s>{I})=", src, "inner overlay")
+    t, n, r, o, s, size = e["t"], e["n"], e["r"], e["o"], e["s"], int(e["size"])
+    e_end = src.find("}function ", e.end())
+    e_end = len(src) - 1 if e_end < 0 else e_end
     body = src[e.start():e_end]
     target = one(rf"\{{portalTarget:{I},rect:{I},selectedText:{I},selectionRange:{I},target:({I})\}}={I}", body,
                  "selection target").group(1)
-    body = body.replace(e.group(0), (
-        f"function {inner}({props}){{let {t}=(0,{e['cache']}.c)({size + 1}),{{onAddResponseTextAnnotation:{n},"
-        f"onMoreDetails:__md,onOpenSideChat:{r},targetContainerRefs:{e['i']},targetSelector:{e['a']}}}={props},"
-        f"{o}={e['zoom']}();if({n}==null&&{r}==null&&__md==null)return null;let {s};"
-        f"{t}[0]!=={n}||{t}[1]!=={r}||{t}[2]!=={o}||{t}[{size}]!==__md?({s}="), 1)
+    head = e.group(0)
+    head = head.replace(f"(0,{e['cache']}.c)({size}),{{onAddResponseTextAnnotation:{n},",
+                        f"(0,{e['cache']}.c)({size + 1}),{{onAddResponseTextAnnotation:{n},onMoreDetails:__md,", 1)
+    head = head.replace(f"return null=={n}&&null=={r}?null:({t}[0]!=={n}||{t}[1]!=={r}||{t}[2]!=={o}?",
+                        f"return null=={n}&&null=={r}&&null==__md?null:({t}[0]!=={n}||{t}[1]!=={r}||{t}[2]!=={o}||"
+                        f"{t}[{size}]!==__md?", 1)
+    if "__md" not in head or head.count("__md") != 3:
+        raise PatchError("inner overlay: unexpected header")
+    body = head + body[len(e.group(0)):]
     T, N, R, O, S = (re.escape(x) for x in (t, n, r, o, s))
     mp = one(rf"\}},onOpenSideChat:{R}\}}\)\}}\)\}},{T}\[0\]={N},{T}\[1\]={R},{T}\[2\]={O},{T}\[3\]={S}\):{S}={T}\[3\]",
              body, "inner overlay menu props")
     body = body[:mp.start()] + (
-        f"}},onMoreDetails:__md==null?void 0:__e=>__md(__e,{target}),onOpenSideChat:{r}}})}})}},"
+        f"}},onMoreDetails:null==__md?void 0:__e=>__md(__e,{target}),onOpenSideChat:{r}}})}})}},"
         f"{t}[0]={n},{t}[1]={r},{t}[2]={o},{t}[{size}]=__md,{t}[3]={s}):{s}={t}[3]") + body[mp.end():]
-    bundle[chunk] = src[:e.start()] + body + src[e_end:]
+    b.set_text(mod, src[:e.start()] + body + src[e_end:])
 
 
 # ------------------------------------------------------------------ main
 
 def node_check(name, text):
-    node = shutil.which("node")
-    if node is None:
-        raise PatchError(f"node not found; cannot validate {name}")
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, name.replace(".js", ".mjs"))
         with open(p, "w", encoding="utf-8") as f:
             f.write(text)
-        r = subprocess.run([node, "--check", p], capture_output=True, text=True)
+        r = subprocess.run([node_binary(), "--check", p], capture_output=True, text=True)
         if r.returncode != 0:
             raise PatchError(f"syntax check failed for {name}:\n{r.stderr[-2000:]}")
     print(f"  syntax OK: {name}")
@@ -469,20 +519,22 @@ def app_version(app):
 
 
 def patched_bundles(app):
-    bundle = Bundle(os.path.join(app, "resources/app.asar" if os.name == "nt" else "Contents/Resources/app.asar"))
-    core, names = patch_core(bundle)
-    patch_overlays(bundle, core)
-    if os.name == "nt":
-        # Keep Alt+Space available for the Windows system menu.
-        bundle[core] = bundle[core].replace(
-            "t.code!==`Space`||t.ctrlKey)return;let m=t.metaKey&&t.shiftKey&&!t.altKey,o=t.altKey&&!t.metaKey&&!t.shiftKey",
-            "t.code!==`Space`||t.metaKey)return;let m=t.ctrlKey&&t.shiftKey&&!t.altKey,o=!1",
-            1,
-        )
-    print("  resolved:", ", ".join(f"{k}={v}" for k, v in sorted(names.items())))
-    for name in bundle.changed:
-        node_check(name, bundle[name])
-    return {name: bundle[name] for name in bundle.changed}
+    asar = os.path.join(app, "resources/app.asar" if os.name == "nt" else "Contents/Resources/app.asar")
+    with tempfile.TemporaryDirectory() as work:
+        b = Bundle(asar, work)
+        core, table = patch_core(b)
+        patch_overlays(b, core)
+        if os.name == "nt":
+            # Keep Alt+Space available for the Windows system menu.
+            b.set_text(core, b.text(core).replace(
+                "t.code!==`Space`||t.ctrlKey)return;let m=t.metaKey&&t.shiftKey&&!t.altKey,o=t.altKey&&!t.metaKey&&!t.shiftKey",
+                "t.code!==`Space`||t.metaKey)return;let m=t.ctrlKey&&t.shiftKey&&!t.altKey,o=!1", 1))
+        print("  resolved:", ", ".join(f"{k}={v if len(v) < 40 else v[:37] + '...'}" for k, v in sorted(table.items())))
+        print("  patched modules:", ", ".join(f"{c}:{m}" for c, m in sorted(b.patched)))
+        out = b.output()
+    for name, text in out.items():
+        node_check(name, text)
+    return out
 
 
 def emit(app, out_dir):

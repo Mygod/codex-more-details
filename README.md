@@ -22,7 +22,7 @@ The Windows launcher preserves the Store package identity using `Invoke-CommandI
 
 ### Windows validation and limitations
 
-Tested on Store package **26.1007.2314.0**, desktop **26.1007.21434**, with Python 3.11 and Node.js 22. Both generated bundles passed `node --check`. An isolated, signed-out app loaded both patched bundles and evaluated the restored `__qcMDRun` and `__qcCan` exports. The launcher also verified its Store package identity.
+The patcher was rewritten for the rspack bundle that ChatGPT ships from 26.1029, and the rewrite **hasn't been tested on Windows**. The earlier version was tested on Store package **26.1007.2314.0**, desktop **26.1007.21434**, with Python 3.11 and Node.js 22. Both generated bundles passed `node --check`. An isolated, signed-out app loaded both patched bundles and evaluated the restored `__qcMDRun` and `__qcCan` exports. The launcher also verified its Store package identity.
 
 The signed-in selection-to-Quick-Chat interaction has **not yet been verified**. Quick Chat still depends on the app's existing capability checks. Other Windows versions, architectures, and later app builds have not been tested.
 
@@ -88,7 +88,7 @@ This removes the support folder and the launcher. ChatGPT itself was never chang
 
 1. **ChatGPT More Details.app** runs `launch.sh` in the background.
 2. **`launch.sh`** reads ChatGPT's version. The first time it sees a version (or a changed patch script), it runs `more_details_patch.py` and caches the result. If ChatGPT is already running unpatched, it then offers to quit and reopen it.
-3. **`more_details_patch.py`** reads the webview chunks it needs (`app-initial-*.js`, `app-primary-*.js` and, since 26.1021, the lazily loaded chunk with the selection overlay) out of `app.asar`, read-only. It finds the code by its structure instead of by minified names, reaches names in other chunks through their import and export lists, adds the More details handler and the shortcut, and checks the output with `node --check`. If any pattern doesn't match exactly once, it fails and writes nothing.
+3. **`more_details_patch.py`** reads the webview chunks it needs out of `app.asar`, read-only. Since 26.1029, ChatGPT ships an rspack bundle: each chunk is a table of functions, one per source module, and Node imports the chunks the patcher needs to get exact module boundaries. The patcher finds the code by its structure instead of by minified names, reaches other modules through the app's own module loader and their export maps, adds the More details handler and the shortcut, and checks every patched chunk with `node --check`. If any pattern doesn't match, it fails and writes nothing.
 4. **`inject.mjs`** starts ChatGPT with `--remote-debugging-pipe`. This speaks the DevTools protocol over a private pipe that only the launcher holds, with no TCP port opened. It auto-attaches to each new page and holds it before any script runs (`waitForDebuggerOnStart`). It then intercepts responses for those two files (Fetch interception at the Response stage) and serves the patched copies instead.
 5. **`spawn_disclaim`** starts ChatGPT as its own "responsible process", so macOS privacy permissions (microphone, screen recording and so on) and your existing grants apply to ChatGPT rather than to the launcher.
 
@@ -99,7 +99,8 @@ This removes the support folder and the launcher. ChatGPT itself was never chang
 - **The shortcut only works while ChatGPT is frontmost.** 26.1007 removed the standalone Quick Chat window from the main process, so it can't be a global shortcut.
 - **You must launch ChatGPT with "ChatGPT More Details".** Opening ChatGPT any other way (its own icon, Spotlight, a login item) starts it unpatched. The same goes for ChatGPT restarting itself, for example to install an update: quit it and reopen it with the launcher.
 - **Updates are handled automatically, or fall back to unpatched.** After a ChatGPT update, the next launch re-patches the new version. If OpenAI has changed the code enough that the patch no longer matches, you get a notification and ChatGPT opens normally, without the patch.
-- **Tested on ChatGPT 26.1007.30912 (20156), 26.1013.40934 (20770), 26.1016.61520 (21421) and 26.1021.31345 (21828)** on macOS.
+- **Needs ChatGPT 26.1029 or later.** Earlier versions used a different bundle format, which the patcher no longer supports. For those, use a version of this repo from before the 26.1029 rewrite.
+- **Tested on ChatGPT 26.1029.61003 (24614)** on macOS.
 
 ## macOS troubleshooting
 

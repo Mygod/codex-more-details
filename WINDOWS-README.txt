@@ -2,7 +2,9 @@ Codex More Details - Windows adaptation
 
 Source: https://github.com/Mygod/codex-more-details
 Tested on October 13, 2026 with Store package 26.1007.2314.0
-(desktop version 26.1007.21434).
+(desktop version 26.1007.21434). The patcher has since been rewritten for
+the bundle format ChatGPT uses from 26.1029, and that rewrite has not been
+tested on Windows.
 
 USE
 Quit Codex completely, then open "Codex More Details" from the desktop or
