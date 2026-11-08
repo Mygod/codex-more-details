@@ -100,7 +100,7 @@ This removes the support folder and the launcher. ChatGPT itself was never chang
 - **You must launch ChatGPT with "ChatGPT More Details".** Opening ChatGPT any other way (its own icon, Spotlight, a login item) starts it unpatched. The same goes for ChatGPT restarting itself, for example to install an update: quit it and reopen it with the launcher.
 - **Updates are handled automatically, or fall back to unpatched.** After a ChatGPT update, the next launch re-patches the new version. If OpenAI has changed the code enough that the patch no longer matches, you get a notification and ChatGPT opens normally, without the patch.
 - **Needs ChatGPT 26.1029 or later.** Earlier versions used a different bundle format, which the patcher no longer supports. For those, use a version of this repo from before the 26.1029 rewrite.
-- **Tested on ChatGPT 26.1029.61003 (24614)** on macOS.
+- **Tested on ChatGPT 26.1029.61003 (24614) and 26.1103.41825 (25679)** on macOS.
 
 ## macOS troubleshooting
 

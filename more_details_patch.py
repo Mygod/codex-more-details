@@ -236,17 +236,66 @@ def module_var(b, mod, var):
     return m.group(1)
 
 
+def skip(text, j):
+    """Index just past the string, template literal or bracketed span starting at text[j]."""
+    q = text[j]
+    if q in "\"'":
+        j += 1
+        while text[j] != q:
+            j += 2 if text[j] == "\\" else 1
+        return j + 1
+    if q == "`":
+        j += 1
+        while text[j] != "`":
+            if text[j] == "\\":
+                j += 2
+            elif text.startswith("${", j):
+                j = skip(text, j + 1)
+            else:
+                j += 1
+        return j + 1
+    depth = 0
+    while True:
+        c = text[j]
+        if c in "\"'`":
+            j = skip(text, j)
+            continue
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+        j += 1
+
+
+def object_entries(text, i):
+    """Top-level `key:value` entries of the object literal at text[i] == "{", and the index just past it."""
+    entries, start, j = [], i + 1, i + 1
+    while text[j] != "}":
+        c = text[j]
+        if c in "\"'`([{":
+            j = skip(text, j)
+            continue
+        if c == ",":
+            entries.append(text[start:j])
+            start = j + 1
+        j += 1
+    entries.append(text[start:j])
+    return [e for e in entries if e], j + 1
+
+
 def export_map(b, mod):
-    """(match of the first export call or None, {local or `x.y`: exported name}) from mod's `require.d(exports, ...)`."""
+    """(index of the first export object or None, {local or `x.y`: exported name}) from mod's `require.d(exports, ...)`
+    calls. Their getter and value objects can hold inline functions (26.1103), so only plain names are read."""
     text, names, first = b.text(mod), {}, None
-    for m in re.finditer(rf"{re.escape(mod.require)}\.d\({re.escape(mod.exports)},(\{{[^}}]*\}})(?:,(\{{[^}}]*\}}))?\)", text):
-        first = first or m
-        for part in m.group(1)[1:-1].split(","):
-            key, _, value = part.partition(":()=>")
-            names.setdefault(value, key.strip('"'))
-        for part in (m.group(2) or "{}")[1:-1].split(","):
-            key, _, value = part.partition(":")
-            if value:
+    for m in re.finditer(rf"{re.escape(mod.require)}\.d\({re.escape(mod.exports)},(?=\{{)", text):
+        first = m.end() if first is None else first
+        getters, j = object_entries(text, m.end())
+        values, _ = object_entries(text, j + 1) if text.startswith(",{", j) else ([], j)
+        for part, arrow in [(g, ":()=>") for g in getters] + [(v, ":") for v in values]:
+            key, sep, value = part.partition(arrow)
+            if sep and re.fullmatch(r"[\w$]+(?:\.[\w$]+)?", value):
                 names.setdefault(value, key.strip('"'))
     return first, names
 
@@ -259,7 +308,7 @@ def export(b, mod, local, name=None):
     name = name or f"__qc_{local}"
     text = b.text(mod)
     if first is not None:
-        at = first.start(1) + 1
+        at = first + 1
         b.set_text(mod, text[:at] + f"{name}:()=>{local}," + text[at:])
     else:
         at = text.index("{") + 1
@@ -296,8 +345,9 @@ QC = r'\{name:"chatgpt\.quick-chat"\}'
 TOGGLE_RE = rf"function ({I})\(e,t=\{{\}}\)\{{if\(!e\.get\(({M}),{QC}\)\.isCapable\)return;let n=e\.get\(({I})\),r=e\.get\(({I})\);"
 
 # The new-session function opens the session with an inline function; its default supplies the id generator.
-OPENER_RE = (rf"\((?P<fn>function\(e,\{{conversationId:t=\(0,(?P<newid>{M})\)\(\),contextSourceThread:n=null,"
-             rf"projectId:r=null,projectName:i=null,preservePreviousSession:a=!1\}}=\{{\}}\)\{{[^{{}}]*(?:\{{[^{{}}]*\}}[^{{}}]*)*\}})\)\(e,")
+# Its other options vary (26.1103 added previewSession), so only the first is matched.
+OPENER_RE = (rf"\((?P<fn>function\(e,\{{conversationId:t=\(0,(?P<newid>{M})\)\(\),contextSourceThread:[^}}]*\}}=\{{\}}\)"
+             rf"\{{[^{{}}]*(?:\{{[^{{}}]*\}}[^{{}}]*)*\}})\)\(e,")
 
 SUBMIT_RE = (rf"let {I}=e\.get\((?P<model>{M}),t\);e\.set\((?P<submitting>{M}),t,!0\);try\{{let (?P<hints>{I})={I}\?\?"
              rf"e\.get\({M},t\),{I}=null=={I}\|\|0===(?P<prompt>{I})\.trim\(\)\.length\?void 0:\(0,(?P<build>{M})\)\(\{{"
@@ -315,11 +365,12 @@ SERVER_ID_RE = (rf"(?<![\w$.])({I})=\(0,{M}\)\({M},\(e,\{{get:t\}}\)=>null==e\?n
 STREAMING_RE = (rf"(?<![\w$.])({I})=\(0,{M}\)\({M},\(e,\{{get:t\}}\)=>\{{let n=\(0,{M}\)\(t,e\);if\(null==n\|\|!{I}\("
                 rf"t\({I},e\)\)\)return!1;let r=t\({M},n\);return null==r\|\|t\({M},n\)!==r\}}\)")
 
-PLAIN_TEXT_RE = (rf"function ({I})\(({I}),\{{includeImages:{I}=!1,includeCollapsedContent:{I}=!1[^}}]*\}}=\{{\}}\)\{{"
-                 rf"let ({I})=\2\.ownerDocument\.createRange\(\);return \3\.selectNodeContents\(\2\)")
+# Calls of the message text extractor. Since 26.1103 it is an anonymous function in its module's export map, so
+# it is found through its callers.
+PLAIN_TEXT_RE = rf"\(0,({M})\)\({I},\{{includeCollapsedContent:!0\}}\)"
 
-# The Quick Chat host component, up to and including its useLayoutEffect call.
-HOST_RE = (rf"\{{surfaceOwner:(?P<owner>{I})\}}=(?P<props>{I}),(?P<store>{I})=\(0,{M}\)\({M}\);"
+# The Quick Chat host component, up to and including its useLayoutEffect call. 26.1103 added a paneBody prop.
+HOST_RE = (rf"\{{(?:{I}:{I},)*surfaceOwner:(?P<owner>{I})(?:,{I}:{I})*\}}=(?P<props>{I}),(?P<store>{I})=\(0,{M}\)\({M}\);"
            rf"(?P<t>{I})\[0\]===Symbol\.for\(\"react\.memo_cache_sentinel\"\)\?\((?P<k>{I})={QC},(?P=t)\[0\]=(?P=k)\):"
            rf"(?P=k)=(?P=t)\[0\];let (?P<a>{I})=\(0,{M}\)\((?P<bo>{M}),(?P=k)\)\.isCapable,(?P<o>{I})=\(0,{M}\)\("
            rf"(?P<disabled>{M})\),(?P<s>{I})=(?P=a)&&!(?P=o);return\((?P=t)\[1\]!==(?P=s)\|\|(?P=t)\[2\]!==(?P=store)\?"
@@ -352,9 +403,13 @@ def patch_core(b):
                "quick chat conversation-started").group(1)
     close = one(rf"function ({I})\(e,t=\{{\}}\)\{{\(0,{M}\)\(e,0\);let n=e\.get\({re.escape(visible)}\),r=e\.get\("
                 rf"{re.escape(session)}\)", src, "quick chat close").group(1)
-    context = one(rf"async function ({I})\(e,\{{isBackgroundSubagentsEnabled:t,sourceThread:n,signal:r\}}\)\{{let i="
-                  rf"\(await {I}\(e,\{{sourceThread:n,signal:r,isBackgroundSubagentsEnabled:t,markdownLimit:", src,
-                  "Codex context builder").group(1)
+    # context(e, sourceThread) builds the Codex thread context with background subagents included, as More details
+    # always asked for. 26.1103 inlined the underlying builder into it, so find the wrapper from its call.
+    call = one(r"\(e,\{isBackgroundSubagentsEnabled:!0,sourceThread:t\}\)\}", src, "Codex context call")
+    heads = list(re.finditer(rf"function ({I})\(e,t\)\{{return ", src[:call.start()]))
+    if not heads:
+        raise PatchError("Codex context builder not found")
+    context = heads[-1].group(1)
     thread_host = one(rf"\{{threadId:({I}),hostId:{I}\.get\(({M}),\1\)\}}", src, "thread host atom").group(2)
 
     table = {"TOGGLE": toggle, "BO": bo, "SESSION": session, "SHOW": show, "VISIBLE": visible, "CLOSE": close,
@@ -371,8 +426,11 @@ def patch_core(b):
     table["SERVERID"] = req(*ref(b, mod, m.group(1)))
     [(mod, m)] = b.find(STREAMING_RE, "streaming atom", "return null==r||t(")
     table["STREAMING"] = req(*ref(b, mod, m.group(1)))
-    [(mod, m)] = b.find(PLAIN_TEXT_RE, "plain text extractor", "includeCollapsedContent:")
-    table["PLAINTEXT"] = req(*ref(b, mod, m.group(1)))
+    extractors = {ref(b, mod, m.group(1)) for mod, m in b.find(PLAIN_TEXT_RE, "plain text extractor",
+                                                               "includeCollapsedContent:!0", count=None)}
+    if len(extractors) != 1:
+        raise PatchError(f"plain text extractor: expected 1 function, found {sorted(extractors)}")
+    table["PLAINTEXT"] = req(*extractors.pop())
 
     # The toast atom, as most modules in this chunk use it.
     toasts = collections.Counter(ref(b, b.module_at(core.chunk, t.start()), t.group(1))
@@ -392,7 +450,7 @@ function __qcN(){return __qcT??=TABLE}
 function __qcCan(e){try{return e.get(BO,__qcCapKey).isCapable&&!e.get(DISABLED)}catch{return!1}}
 function __qcTrunc(e,t){let L=4e4,R=`\n\n… Codex conversation truncated …\n\n`,Z=`\n\n… selected text shown above …\n\n`;if(e.length<=L)return e;let n=e.indexOf(t);if(n===-1){let r=L-R.length,i=Math.floor(r/2),a=r-i;return`${e.slice(0,i)}${R}${e.slice(-a)}`}let r=n+t.length;return`${e.slice(Math.max(0,n-19983),n)}${Z}${e.slice(r,r+19984)}`}
 function __qcBusy(e,t){return e(SUBMITTING,t)||e(SERVERID,t)==null&&e(STREAMING,t)}
-async function __qcPrep(e,t,n){let r=t.selectedText.trim();if(r.length===0)return null;let i=__qcTrunc(t.selectedMessageText.trim()||r,r),o=[...await CODEXCONTEXT(e,{isBackgroundSubagentsEnabled:t.isBackgroundSubagentsEnabled,sourceThread:{threadId:t.sourceConversationId,hostId:e.get(THREADHOST,t.sourceConversationId)}}),`The user is referring to this in particular:\n${r}\n\n---\n\nThe selection appears in the following source message. Prioritize this source message over the broader conversation context:\n\n${i}`],a=e.get(MODELSETTINGS,n);return{model:a.slug,thinkingEffort:a.thinkingEffort,userCompletionMessages:BUILDMESSAGES({extraDeveloperInstructions:o,messageMetadata:{is_visually_hidden_from_conversation:!0,targeted_reply:r,targeted_reply_label:t.targetedReplyLabel},prompt:t.prompt})}}
+async function __qcPrep(e,t,n){let r=t.selectedText.trim();if(r.length===0)return null;let i=__qcTrunc(t.selectedMessageText.trim()||r,r),o=[...await CODEXCONTEXT(e,{threadId:t.sourceConversationId,hostId:e.get(THREADHOST,t.sourceConversationId)}),`The user is referring to this in particular:\n${r}\n\n---\n\nThe selection appears in the following source message. Prioritize this source message over the broader conversation context:\n\n${i}`],a=e.get(MODELSETTINGS,n);return{model:a.slug,thinkingEffort:a.thinkingEffort,userCompletionMessages:BUILDMESSAGES({extraDeveloperInstructions:o,messageMetadata:{is_visually_hidden_from_conversation:!0,targeted_reply:r,targeted_reply_label:t.targetedReplyLabel},prompt:t.prompt})}}
 async function __qcStart(e,t){if(!e.get(BO,{name:`chatgpt.quick-chat`}).isCapable)return;let n=e.get(SESSION),i=n?.selectedTextSourceConversationId===t.sourceConversationId?n.conversationId:__qcPend.find(e=>e.sourceConversationId===t.sourceConversationId)?.conversationId??NEWID(),a={conversationId:i,sourceConversationId:t.sourceConversationId};__qcPend=[...__qcPend,a];let o;try{o=await __qcPrep(e,t,i)}finally{__qcPend=__qcPend.filter(e=>e!==a)}if(o==null)return;for(;__qcBusy(e.get,i);)await e.when(({get:e})=>!__qcBusy(e,i));if(!e.get(BO,{name:`chatgpt.quick-chat`}).isCapable)return;let s=e.get(SESSION);e.set(SUBMITTING,i,!0),e.set(PENDINGMARKDOWN,i,!1),e.set(PENDINGPROMPT,i,t.prompt),s?.conversationId===i?e.set(SESSION,{...s,selectedTextSourceConversationId:t.sourceConversationId}):(OPENSESSION(e,{conversationId:i}),e.set(SESSION,{...e.get(SESSION),selectedTextSourceConversationId:t.sourceConversationId})),SHOW(e,!0),MARKSTARTED(e,i);try{await SEND(e,{conversationId:i,model:o.model,prompt:t.prompt,thinkingEffort:o.thinkingEffort,userCompletionMessages:o.userCompletionMessages})}finally{e.set(PENDINGPROMPT,i,null),e.set(SUBMITTING,i,!1)}}
 var __qcKeyScopes=[];
 function __qcBindKeys(e,n,s){if(n!=null||!s)return;__qcKeyScopes.push(e);window.__qcKeysBound||(window.__qcKeysBound=!0,window.addEventListener(`keydown`,__qcOnKey,!0));return()=>{let t=__qcKeyScopes.lastIndexOf(e);t>=0&&__qcKeyScopes.splice(t,1)}}
