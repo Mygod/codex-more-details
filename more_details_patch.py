@@ -354,9 +354,10 @@ SUBMIT_RE = (rf"let {I}=e\.get\((?P<model>{M}),t\);e\.set\((?P<submitting>{M}),t
              rf"messageMetadata:{I},oneTurnDeveloperInstructions:{I},prompt:(?P=prompt),systemHints:(?P=hints)\}}\),"
              rf"{I}=await \(0,(?P<send>{M})\)\(e,\{{conversationId:t,")
 
-# Pending prompt (null) and pending markdown (false) atoms, around a derived "last user message" atom, then lists.
+# Pending prompt (null) and pending message options atoms, around a derived "last user message" atom, then lists.
+# Since 26.1106 the options atom holds {renderMarkdown} (and image settings) instead of a markdown flag.
 PENDING_RE = (rf"(?P<prompt>{I})=\(0,(?P<f>{M})\)\((?P<s>{M}),e=>null\),(?:{I}=\(0,{M}\)\((?P=s),\(e,\{{get:t\}}\)=>[^;]*?\),)?"
-              rf"(?P<markdown>{I})=\(0,(?P=f)\)\((?P=s),e=>!1\),{I}=\(0,(?P=f)\)\((?P=s),e=>\[\]\),"
+              rf"(?P<options>{I})=\(0,(?P=f)\)\((?P=s),e=>\(\{{renderMarkdown:!1\}}\)\),{I}=\(0,(?P=f)\)\((?P=s),e=>\[\]\),"
               rf"{I}=\(0,(?P=f)\)\((?P=s),e=>\[\]\),{I}=\(0,(?P=f)\)\((?P=s),e=>\[\]\)")
 
 SERVER_ID_RE = (rf"(?<![\w$.])({I})=\(0,{M}\)\({M},\(e,\{{get:t\}}\)=>null==e\?null:\(0,{M}\)\(e\)\?t\({M},e\):"
@@ -421,7 +422,7 @@ def patch_core(b):
                        ("SEND", "send")):
         table[key] = req(*ref(b, mod, m[group]))
     [(mod, m)] = b.find(PENDING_RE, "pending prompt atoms", 'findLast(e=>"user"===e.author.role')
-    table["PENDINGPROMPT"], table["PENDINGMARKDOWN"] = req(*ref(b, mod, m["prompt"])), req(*ref(b, mod, m["markdown"]))
+    table["PENDINGPROMPT"], table["PENDINGOPTIONS"] = req(*ref(b, mod, m["prompt"])), req(*ref(b, mod, m["options"]))
     [(mod, m)] = b.find(SERVER_ID_RE, "server conversation id atom", "(e,{get:t})=>null==e?null:")
     table["SERVERID"] = req(*ref(b, mod, m.group(1)))
     [(mod, m)] = b.find(STREAMING_RE, "streaming atom", "return null==r||t(")
@@ -451,7 +452,7 @@ function __qcCan(e){try{return e.get(BO,__qcCapKey).isCapable&&!e.get(DISABLED)}
 function __qcTrunc(e,t){let L=4e4,R=`\n\n… Codex conversation truncated …\n\n`,Z=`\n\n… selected text shown above …\n\n`;if(e.length<=L)return e;let n=e.indexOf(t);if(n===-1){let r=L-R.length,i=Math.floor(r/2),a=r-i;return`${e.slice(0,i)}${R}${e.slice(-a)}`}let r=n+t.length;return`${e.slice(Math.max(0,n-19983),n)}${Z}${e.slice(r,r+19984)}`}
 function __qcBusy(e,t){return e(SUBMITTING,t)||e(SERVERID,t)==null&&e(STREAMING,t)}
 async function __qcPrep(e,t,n){let r=t.selectedText.trim();if(r.length===0)return null;let i=__qcTrunc(t.selectedMessageText.trim()||r,r),o=[...await CODEXCONTEXT(e,{threadId:t.sourceConversationId,hostId:e.get(THREADHOST,t.sourceConversationId)}),`The user is referring to this in particular:\n${r}\n\n---\n\nThe selection appears in the following source message. Prioritize this source message over the broader conversation context:\n\n${i}`],a=e.get(MODELSETTINGS,n);return{model:a.slug,thinkingEffort:a.thinkingEffort,userCompletionMessages:BUILDMESSAGES({extraDeveloperInstructions:o,messageMetadata:{is_visually_hidden_from_conversation:!0,targeted_reply:r,targeted_reply_label:t.targetedReplyLabel},prompt:t.prompt})}}
-async function __qcStart(e,t){if(!e.get(BO,{name:`chatgpt.quick-chat`}).isCapable)return;let n=e.get(SESSION),i=n?.selectedTextSourceConversationId===t.sourceConversationId?n.conversationId:__qcPend.find(e=>e.sourceConversationId===t.sourceConversationId)?.conversationId??NEWID(),a={conversationId:i,sourceConversationId:t.sourceConversationId};__qcPend=[...__qcPend,a];let o;try{o=await __qcPrep(e,t,i)}finally{__qcPend=__qcPend.filter(e=>e!==a)}if(o==null)return;for(;__qcBusy(e.get,i);)await e.when(({get:e})=>!__qcBusy(e,i));if(!e.get(BO,{name:`chatgpt.quick-chat`}).isCapable)return;let s=e.get(SESSION);e.set(SUBMITTING,i,!0),e.set(PENDINGMARKDOWN,i,!1),e.set(PENDINGPROMPT,i,t.prompt),s?.conversationId===i?e.set(SESSION,{...s,selectedTextSourceConversationId:t.sourceConversationId}):(OPENSESSION(e,{conversationId:i}),e.set(SESSION,{...e.get(SESSION),selectedTextSourceConversationId:t.sourceConversationId})),SHOW(e,!0),MARKSTARTED(e,i);try{await SEND(e,{conversationId:i,model:o.model,prompt:t.prompt,thinkingEffort:o.thinkingEffort,userCompletionMessages:o.userCompletionMessages})}finally{e.set(PENDINGPROMPT,i,null),e.set(SUBMITTING,i,!1)}}
+async function __qcStart(e,t){if(!e.get(BO,{name:`chatgpt.quick-chat`}).isCapable)return;let n=e.get(SESSION),i=n?.selectedTextSourceConversationId===t.sourceConversationId?n.conversationId:__qcPend.find(e=>e.sourceConversationId===t.sourceConversationId)?.conversationId??NEWID(),a={conversationId:i,sourceConversationId:t.sourceConversationId};__qcPend=[...__qcPend,a];let o;try{o=await __qcPrep(e,t,i)}finally{__qcPend=__qcPend.filter(e=>e!==a)}if(o==null)return;for(;__qcBusy(e.get,i);)await e.when(({get:e})=>!__qcBusy(e,i));if(!e.get(BO,{name:`chatgpt.quick-chat`}).isCapable)return;let s=e.get(SESSION);e.set(SUBMITTING,i,!0),e.set(PENDINGOPTIONS,i,{renderMarkdown:!1}),e.set(PENDINGPROMPT,i,t.prompt),s?.conversationId===i?e.set(SESSION,{...s,selectedTextSourceConversationId:t.sourceConversationId}):(OPENSESSION(e,{conversationId:i}),e.set(SESSION,{...e.get(SESSION),selectedTextSourceConversationId:t.sourceConversationId})),SHOW(e,!0),MARKSTARTED(e,i);try{await SEND(e,{conversationId:i,model:o.model,prompt:t.prompt,thinkingEffort:o.thinkingEffort,userCompletionMessages:o.userCompletionMessages})}finally{e.set(PENDINGPROMPT,i,null),e.set(SUBMITTING,i,!1)}}
 var __qcKeyScopes=[];
 function __qcBindKeys(e,n,s){if(n!=null||!s)return;__qcKeyScopes.push(e);window.__qcKeysBound||(window.__qcKeysBound=!0,window.addEventListener(`keydown`,__qcOnKey,!0));return()=>{let t=__qcKeyScopes.lastIndexOf(e);t>=0&&__qcKeyScopes.splice(t,1)}}
 function __qcOnKey(t){if(t.repeat||t.code!==`Space`||t.ctrlKey)return;let m=t.metaKey&&t.shiftKey&&!t.altKey,o=t.altKey&&!t.metaKey&&!t.shiftKey;if(!m&&!o)return;let e=__qcKeyScopes[__qcKeyScopes.length-1];if(e==null)return;t.preventDefault(),t.stopPropagation();try{e.get(VISIBLE)&&e.get(SESSION)!=null?CLOSE(e):TOGGLE(e,{})}catch(n){console.error(`[more-details] Quick Chat shortcut failed`,n)}}
